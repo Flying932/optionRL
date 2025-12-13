@@ -451,7 +451,8 @@ class weightPPO:
         train = not cal_dim
         reduce_call = self.feature_adapter(call_dict, train=train)
         reduce_put = self.feature_adapter(put_dict, train=train)
-        features = torch.cat([current_state, reduce_call, reduce_put], dim=-1, device=self.device)
+        features = torch.cat([current_state, reduce_call, reduce_put], dim=-1).to(self.device)
+
 
         if self.state_norm is None:
             self.init_norm_state(features)

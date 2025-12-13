@@ -6,6 +6,7 @@
     2. DataCache 使用 multiprocessing.Manager 共享内存，解决多进程重复读取导致的 Miss 刷屏。
 """
 from math import e
+from pyperclip import is_available
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -36,6 +37,7 @@ A_HOLD, A_LONG, A_SHORT, A_CLOSE = 0, 1, 2, 3
 WEIGHT_BINS_CPU = torch.tensor([0.00, 0.25, 0.50, 0.75, 1.00])  # 离散权重
 
 DESK_PATH = 'C:/Users/Flying/Desktop' # 请根据实际路径修改
+DESK_PATH = './miniQMT/DL/results'
 # DESK_PATH = 'C:/Users/David/Desktop' 
 
 # -----------------------------------------------------------
@@ -92,7 +94,7 @@ class DataCache:
         
         # 3. 写入共享字典
         shared_dict[key] = data_pack
-        print(f"[DataCache][{p_name}] Loaded & Shared {len(close_arr)} steps.")
+        # print(f"[DataCache][{p_name}] Loaded & Shared {len(close_arr)} steps.")
         
         del temp_acct
         return data_pack
@@ -1028,6 +1030,9 @@ if __name__ == '__main__':
         max_timesteps=1000, 
         # num_workers=5      
     )
+
+    if torch.cuda.is_available():
+        cfg.num_workers = cfg.num_workers + 2
     
 
     agent = Agent(cfg)

@@ -394,7 +394,7 @@ class weightPPO:
             SAVE_PATH = f'./miniQMT/DL/preTrain/weights/preMOE_best_dummy_data_{self.window_size}_{self.pre_len}.pth'
             state_dict = torch.load(SAVE_PATH, map_location=self.device)
             self.extractor.load_state_dict(state_dict)
-            print(f"[Info] 加载MOE参数成功~")
+            print(f"[Info] 加载MOE参数成功, device = {self.device}")
         except Exception as e:
             print(f"[Info] 加载MOE参数失败, e = {e}")
 
@@ -451,7 +451,7 @@ class weightPPO:
         train = not cal_dim
         reduce_call = self.feature_adapter(call_dict, train=train)
         reduce_put = self.feature_adapter(put_dict, train=train)
-        features = torch.cat([current_state, reduce_call, reduce_put], dim=-1)
+        features = torch.cat([current_state, reduce_call, reduce_put], dim=-1, device=self.device)
 
         if self.state_norm is None:
             self.init_norm_state(features)

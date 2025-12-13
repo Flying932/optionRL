@@ -1480,34 +1480,36 @@ def gen_label_data(target: str='510050'):
     # option_list = account.get_option_list(target, '202410', 'call')
     # option_list.extend(account.get_option_list(target, '202410', 'put'))
 
-    # option_list.extend(account.get_option_list(target, '202509', 'call'))
-    # option_list.extend(account.get_option_list(target, '202509', 'put'))
+    option_list.extend(account.get_option_list(target, '202509', 'call'))
+    option_list.extend(account.get_option_list(target, '202509', 'put'))
 
-    # option_list.extend(account.get_option_list(target, '202508', 'call'))
-    # option_list.extend(account.get_option_list(target, '202508', 'put'))
+    option_list.extend(account.get_option_list(target, '202508', 'call'))
+    option_list.extend(account.get_option_list(target, '202508', 'put'))
 
-    # option_list.extend(account.get_option_list(target, '202507', 'call'))
-    # option_list.extend(account.get_option_list(target, '202507', 'put'))
+    option_list.extend(account.get_option_list(target, '202507', 'call'))
+    option_list.extend(account.get_option_list(target, '202507', 'put'))
 
-    # option_list.extend(account.get_option_list(target, '202506', 'call'))
-    # option_list.extend(account.get_option_list(target, '202506', 'put'))
+    option_list.extend(account.get_option_list(target, '202506', 'call'))
+    option_list.extend(account.get_option_list(target, '202506', 'put'))
 
-    # option_list.extend(account.get_option_list(target, '202505', 'call'))
-    # option_list.extend(account.get_option_list(target, '202505', 'put'))
+    option_list.extend(account.get_option_list(target, '202505', 'call'))
+    option_list.extend(account.get_option_list(target, '202505', 'put'))
 
-    # option_list.extend(account.get_option_list(target, '202504', 'call'))
-    # option_list.extend(account.get_option_list(target, '202504', 'put'))
+    option_list.extend(account.get_option_list(target, '202504', 'call'))
+    option_list.extend(account.get_option_list(target, '202504', 'put'))
 
-    # option_list.extend(account.get_option_list(target, '202503', 'call'))
-    # option_list.extend(account.get_option_list(target, '202503', 'put'))
+    option_list.extend(account.get_option_list(target, '202503', 'call'))
+    option_list.extend(account.get_option_list(target, '202503', 'put'))
 
-    # option_list.extend(account.get_option_list(target, '202502', 'call'))
-    # option_list.extend(account.get_option_list(target, '202502', 'put'))
+    option_list.extend(account.get_option_list(target, '202502', 'call'))
+    option_list.extend(account.get_option_list(target, '202502', 'put'))
 
-    # option_list.extend(account.get_option_list(target, '202501', 'call'))
-    # option_list.extend(account.get_option_list(target, '202501', 'put'))
+    option_list.extend(account.get_option_list(target, '202501', 'call'))
+    option_list.extend(account.get_option_list(target, '202501', 'put'))
 
-    lis = get_exist_option_list()
+
+    lis = get_exist_option_list(file_path='./miniQMT/datasets/test_label_train_data')
+    lis.extend(get_exist_option_list(file_path='./miniQMT/datasets/label_train_data'))
 
     new_lis = []
     for op in lis:
@@ -1546,7 +1548,8 @@ def gen_label_data(target: str='510050'):
                     }
                 )
                 break
-    res = []
+    df = pd.DataFrame(pairs)
+    df.to_excel('./miniQMT/datasets/all_label_data/20251213_train.xlsx')
 
     
     print(0 / 0)
@@ -1651,7 +1654,7 @@ def gen_label_data(target: str='510050'):
     print(f"[Info] 结束 ({min_less_1, max_less_1}) | ({min_more_1, max_more_1})")
 
 
-gen_label_data()
+# gen_label_data()
 
 # ========================== 用例 ==========================
 if __name__ == '__main_':

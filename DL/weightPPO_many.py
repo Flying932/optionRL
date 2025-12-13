@@ -16,7 +16,7 @@ from windowEnv_parallel import windowEnv
 import time, json
 import sys
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import pickle
 from tools.Norm import Normalization, RewardNormalization, RewardScaling
 from preTrain.preMOE import PreMOE
@@ -25,6 +25,11 @@ import random
 import multiprocessing as mp
 import copy
 from finTool.single_window_account import single_Account  # 用于 DataCache 读取数据
+import os
+
+import warnings
+# 忽略所有 FutureWarning
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 # —— 构造每个样本的权重掩码 —— #
 A_HOLD, A_LONG, A_SHORT, A_CLOSE = 0, 1, 2, 3
@@ -604,10 +609,53 @@ class weightPPO:
                     "device": self.device,
                 },
                 "epoch": epoch,
-                "best_reward": best_reward.item(),
+                "best_reward": best_reward.item() if hasattr(best_reward, 'item') else best_reward,
+                "state_norm": self.state_norm,
             }
             torch.save(data, save_path)
             print(f"[PPO] checkpoint saved to: {save_path}")
+        
+    def load_checkpoint(self, path: str=None):
+        if path is None:
+            path = self.check_path
+        if not os.path.exists(path):
+            print(f"[Warn] Checkpoint not found at {path}")
+            return None, None
+        
+        print(f"[Resume] Loading checkpoint from {path}...")
+        # 这里的 map_location 非常重要，防止跨设备加载报错
+        data = torch.load(path, map_location=self.device)
+        
+        # 1. 加载网络权重
+        self.actor.load_state_dict(data['actor_state'])
+        self.value.load_state_dict(data['value_state'])
+        self.feature_adapter.load_state_dict(data['features_adapter_state'])
+        
+        # 2. 加载优化器状态
+        if self.opt_a: self.opt_a.load_state_dict(data['opt_a_state'])
+        if self.opt_b: self.opt_b.load_state_dict(data['opt_b_state'])
+        if self.opt_c and 'features_adapter_opt_state' in data:
+            st = data['features_adapter_opt_state']
+            if st is not None: self.opt_c.load_state_dict(st)
+
+        # 3. [新增] 加载 Normalization 状态
+        if 'state_norm' in data:
+            # 直接覆盖当前的 self.state_norm
+            self.state_norm = data['state_norm']
+            print(f"[Resume] State Norm loaded. (count={self.state_norm.running_ms.n if hasattr(self.state_norm.running_ms, 'n') else '?'})")
+        else:
+            print("[Resume] Warning: No state_norm in checkpoint! Training might be unstable.")
+
+        # 4. [新增] 加载 Reward Norm List (可选)
+        if 'reward_norm_list' in data:
+            self.reward_norm_list = data['reward_norm_list']
+
+        epoch = data.get('epoch', 0)
+        best_reward = data.get('best_reward', -float('inf'))
+        
+        print(f"[Resume] Success! Resuming from Epoch {epoch + 1}, Best Reward: {best_reward:.4f}")
+        return epoch, best_reward
+
 
 # -----------------------------------------------------------
 # 主 Agent 类
@@ -656,6 +704,7 @@ class Agent:
     # 训练模式初始化
 # 训练模式初始化 - [已修复序列化报错]
     def init_train(self):
+        print(f'[Agent-init-train] 期权组合数量 = {len(self.cfg.option_pairs)}')
         config = self.cfg
         self.ppo = weightPPO(config.action_dim, device=self.device)
         
@@ -720,7 +769,7 @@ class Agent:
         print(f"[Info] Norm设置完成 | state.n = {self.ppo.state_norm.running_ms.n}")
 
     # 动态并行训练函数
-    def train_parallel_modified_early_stop(self):
+    def train_parallel_modified_early_stop(self, from_check_point: bool=False):
         # 1. 初始化并行环境
         vec_env = SubprocVectorEnv(self.env_fns)
         print(f"[Train] Start dynamic parallel training on {self.device}...")
@@ -733,7 +782,14 @@ class Agent:
         min_delta = 0.001                                     
         early_stop_counter = 0                                
 
+        if from_check_point:
+            start_epoch, best_reward = self.ppo.load_checkpoint()
+
         for epoch in range(self.cfg.max_epochs):
+            if from_check_point and start_epoch is not None:
+                if epoch < start_epoch:
+                    print(f'[Skip] epoch = {epoch}')
+                    continue
             print(f'epoch = {epoch}')
             start_time = time.time()
             
@@ -754,7 +810,6 @@ class Agent:
             
             # --- Rollout Loop ---
             for t in range(self.cfg.max_timesteps):
-                # print(f't = {t}')
                 
                 c_tensor = torch.as_tensor(curr_np, dtype=torch.float32, device=self.device)
                 h_tensor = torch.as_tensor(hist_np, dtype=torch.float32, device=self.device)
@@ -899,33 +954,77 @@ class Agent:
 # 入口
 # -----------------------------------------------------------
 if __name__ == '__main__':
+    if not torch.cuda.is_available():
+        torch.set_num_threads(4)
+        torch.set_num_interop_threads(4)
+
     mp.set_start_method('spawn', force=True) 
 
     # 构造海量期权组合 (示例)
     all_pairs = []
+    dtype = {
+        'call': str,
+        'put': str,
+        'call_strike': int,
+        'put_strike': int,
+        'call_open': str,
+        'put_open': str,
+        'call_expire': str,
+        'put_expire': str,
+    }
+    df = pd.read_excel('./miniQMT/datasets/all_label_data/20251213_train.xlsx', dtype=dtype)
 
-    all_pairs.append({
-        'call': '10006819', 'put': '10006820', 
-        'start_time': '20240201100000', 'end_time': '20240505150000'
-    })
 
-    all_pairs.append({
-        'call': '10007866', 'put': '10007875', 
-        'start_time': '20240926100000', 'end_time': '20241113150000'
-    })
+    for index, row in df.iterrows():
+        start = row['call_open']
+        end = row['call_expire']
 
-    all_pairs.append({
-        'call': '10008545', 'put': '10008554', 
-        'start_time': '20250317100000', 'end_time': '20250617150000'
-    })
+        start_time = datetime.strptime(start, "%Y%m%d")
+        end_time = datetime.strptime(end, "%Y%m%d")
+        days = (end_time - start_time).days
+
+        if days <= 40:
+            continue
+
+        call = row['call']
+        put = row['put']
+        end_time = start_time + timedelta(days=20)
+        end_time = end_time.strftime('%Y%m%d')
+
+        start_time = start + '100000'
+        end_time = end_time + '150000'
+        all_pairs.append({
+            'call': call,
+            'put': put,
+            'start_time': start_time,
+            'end_time': end_time
+        })
+
+
+
+    # all_pairs.append({
+    #     'call': '10006819', 'put': '10006820', 
+    #     'start_time': '20240201100000', 'end_time': '20240505150000'
+    # })
+
+    # all_pairs.append({
+    #     'call': '10007866', 'put': '10007875', 
+    #     'start_time': '20240926100000', 'end_time': '20241113150000'
+    # })
+
+    # all_pairs.append({
+    #     'call': '10008545', 'put': '10008554', 
+    #     'start_time': '20250317100000', 'end_time': '20250617150000'
+    # })
 
     cfg = AgentConfig(
         action_dim=4, 
         option_pairs=all_pairs, 
         max_epochs=500,
-        max_timesteps=2048, 
-        # num_workers=12      
+        max_timesteps=1000, 
+        # num_workers=5      
     )
     
+
     agent = Agent(cfg)
-    agent.train_parallel_modified_early_stop()
+    agent.train_parallel_modified_early_stop(from_check_point=False)

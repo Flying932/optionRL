@@ -453,6 +453,8 @@ class weightPPO:
         reduce_put = self.feature_adapter(put_dict, train=train)
         features = torch.cat([current_state, reduce_call, reduce_put], dim=-1).to(self.device)
 
+        if cal_dim:
+            return features
 
         if self.state_norm is None:
             self.init_norm_state(features)
@@ -715,7 +717,8 @@ class Agent:
         
         # 2. 确定 Worker 数量
         num_workers = min(len(config.option_pairs), config.num_workers)
-        if num_workers < 1: num_workers = 1
+        if num_workers < 1: 
+            num_workers = 1
         self.num_workers = num_workers
         print(f"[Init] Detect {mp.cpu_count()} CPUs, Launching {num_workers} workers.")
 

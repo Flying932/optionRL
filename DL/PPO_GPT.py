@@ -1670,7 +1670,7 @@ if __name__ == "__main__":
         option_pairs=option_pairs,
         pretrained_path="./miniQMT/DL/preTrain/weights/preMOE_best_dummy_data_32_4.pth",
         epochs=500,
-        rollout_T=2048,
+        rollout_T=8192,
         num_workers=10,
         save_excel=True,
     )

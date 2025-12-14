@@ -42,7 +42,6 @@ A_HOLD, A_LONG, A_SHORT, A_CLOSE = 0, 1, 2, 3
 WEIGHT_BINS = np.array([0.00, 0.25, 0.50, 0.75, 1.00], dtype=np.float32)
 
 
-PRETRAINED_PATH = "./miniQMT/DL/preTrain/weights/preMOE_best_dummy_data_32_4_20251214.pth"
 
 
 # =========================
@@ -1052,7 +1051,7 @@ class AgentConfig:
 
     # logging
     save_excel: bool = False
-    excel_path: str = "./results/PPO_training_data.xlsx"
+    excel_path: str = "./miniQMT/DL/results/PPO_training_data.xlsx"
 
 
 class Agent:
@@ -1483,10 +1482,10 @@ class Agent:
                 # rollout_len 用 max steps，确保组内每个 pair 都能跑到自己 done（完整周期）
                 rollout_len = int(group_max_steps[g_idx])
 
-                print(f"[Info: 采样] Group_idx = {g_idx}, rollout_len = {rollout_len} ")
 
                 # padding tasks：填满 workers（避免 vec_env 断言）
                 task_ids = group.copy()
+                print(f"choose_task_ids = {task_ids}, sum_roll_len = {sampled_steps_sum}")
                 while len(task_ids) < workers:
                     task_ids.append(task_ids[-1])
 
@@ -1671,8 +1670,8 @@ if __name__ == "__main__":
         option_pairs=option_pairs,
         pretrained_path="./miniQMT/DL/preTrain/weights/preMOE_best_dummy_data_32_4.pth",
         epochs=500,
-        rollout_T=512,
-        num_workers=3,
+        rollout_T=2048,
+        num_workers=10,
         save_excel=True,
     )
 

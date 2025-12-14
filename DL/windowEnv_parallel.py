@@ -179,6 +179,9 @@ class windowEnv(baseEnv):
         info = self.account_controller.getInfo()
 
         return current_state, history_state, info
+
+    def get_total_length(self):
+        return self.total_length
     
     def close(self):
         if hasattr(self, 'account_controller'):

@@ -12,7 +12,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 from torch.distributions import Categorical
-from windowEnv_parallel import windowEnv
+from windowEnv_parallel_fast import windowEnv
 import time, json
 import sys
 import pandas as pd
@@ -60,7 +60,7 @@ class DataCache:
             return np.array([str(x).replace(' ', '').replace('-', '').replace(':', '') for x in ts_series])
 
     @classmethod
-    def get_data(cls, shared_dict, benchmark, start_time, end_time, init_capital, fee):
+    def get_data(cls, shared_dict, shared_lock, benchmark, start_time, end_time, init_capital, fee):
         """
         获取数据: 先查共享内存，没有再读盘并写入共享内存
         """
@@ -75,27 +75,36 @@ class DataCache:
         p_name = mp.current_process().name
         print(f"[DataCache][{p_name}] Miss! Loading {key}...")
         
-        # 使用临时账户读取
-        temp_acct = single_Account(init_capital, fee, '30m', [benchmark])
-        df = temp_acct.real_info_controller.get_bars_between_from_df(benchmark, start_time, end_time)
-        
-        # 转 Numpy
-        close_arr = df['close'].values.astype(np.float32)
-        ts_arr = cls.clean_ts(df['ts'])
-        
-        # 封装数据包
-        data_pack = {
-            'close_arr': close_arr,
-            'ts_arr': ts_arr,
-            'benchmark': benchmark
-        }
-        
-        # 3. 写入共享字典
-        shared_dict[key] = data_pack
-        # print(f"[DataCache][{p_name}] Loaded & Shared {len(close_arr)} steps.")
-        
-        del temp_acct
-        return data_pack
+        # 🔥🔥🔥 引入共享锁 🔥🔥🔥
+        with shared_lock:
+            # 必须二次检查：在等待锁的过程中，其他进程可能已经加载并写入了数据
+            if key in shared_dict:
+                print(f"[DataCache][{p_name}] Secondary Hit! Key {key} already loaded.")
+                return shared_dict[key]
+
+            # 真正未命中，开始读盘
+            
+            # 使用临时账户读取
+            temp_acct = single_Account(init_capital, fee, '30m', [benchmark])
+            df = temp_acct.real_info_controller.get_bars_between_from_df(benchmark, start_time, end_time)
+            
+            # 转 Numpy
+            close_arr = df['close'].values.astype(np.float32)
+            ts_arr = cls.clean_ts(df['ts'])
+            
+            # 封装数据包
+            data_pack = {
+                'close_arr': close_arr,
+                'ts_arr': ts_arr,
+                'benchmark': benchmark
+            }
+            
+            # 3. 写入共享字典 (写入完成后，锁自动释放)
+            shared_dict[key] = data_pack
+            print(f"[DataCache][{p_name}] Loaded & Shared {len(close_arr)} steps. Lock Released.") 
+            
+            del temp_acct
+            return data_pack
 
 # 输出类
 class outPut():
@@ -162,6 +171,7 @@ def worker(remote, parent_remote, env_fn_wrapper):
     try:
         while True:
             cmd, data = remote.recv()
+            
             if cmd == 'step':
                 action, weight = data
                 nc, nh, r, term, trunc = env.step(action, weight)
@@ -172,6 +182,9 @@ def worker(remote, parent_remote, env_fn_wrapper):
                 
                 if term or trunc:
                     info['final_equity'] = env.account_controller.equity
+                    # 注意：SubprocVectorEnv 的 worker 在 done 后会自动 reset
+                    # 如果之前调用过 set_task，这里的 reset 依然会跑指定的组合
+                    # 除非主进程再次调用 set_task 切换任务
                     nc, nh, _ = env.reset()
                 
                 remote.send((nc, nh, r, term, trunc, info))
@@ -182,6 +195,14 @@ def worker(remote, parent_remote, env_fn_wrapper):
                 if hasattr(env, 'account_controller'):
                     info['equity'] = env.account_controller.equity
                 remote.send((nc, nh, info))
+            
+            # 🔥 [新增] 设置任务索引
+            elif cmd == 'set_task':
+                idx = data
+                # 调用 DynamicWindowEnv 的 set_task 方法
+                if hasattr(env, 'set_task'):
+                    env.set_task(idx)
+                remote.send(None) # 发送确认信号 (Ack)
             
             elif cmd == 'close':
                 env.close()
@@ -194,7 +215,7 @@ def worker(remote, parent_remote, env_fn_wrapper):
     except Exception as e:
         print(f'SubprocEnv worker error: {e}')
     finally:
-        env.close() # <--- 这里会调用 DynamicWindowEnv.close()，必须保证该方法存在
+        env.close()
 
 class SubprocVectorEnv:
     def __init__(self, env_fns):
@@ -225,6 +246,21 @@ class SubprocVectorEnv:
         currents, histories, infos = zip(*results)
         return np.stack(currents), np.stack(histories), infos
 
+    # 🔥 [新增] 给每个 Worker 分配特定的任务索引
+    def set_tasks(self, task_indices):
+        """
+        task_indices: list, 长度必须等于 num_envs
+        """
+        assert len(task_indices) == self.num_envs, "任务数必须匹配 Worker 数"
+        
+        # 1. 发送指令
+        for remote, idx in zip(self.remotes, task_indices):
+            remote.send(('set_task', idx))
+        
+        # 2. 等待确认 (同步)
+        for remote in self.remotes:
+            remote.recv()
+
     def close(self):
         if self.closed: return
         for remote in self.remotes:
@@ -237,65 +273,60 @@ class SubprocVectorEnv:
 # 动态环境包装器 (修复 Missing Close Method)
 # -----------------------------------------------------------
 class DynamicWindowEnv:
-    def __init__(self, option_pairs, global_cfg, shared_cache, seed=0):
+    def __init__(self, option_pairs, global_cfg, shared_cache, shared_lock, seed=0):
         self.all_pairs = option_pairs
         self.cfg = global_cfg
-        self.rng = random.Random(seed)
+        self.shared_cache = shared_cache
         self.current_env = None
-        self.shared_cache = shared_cache # 保存共享字典
-        
+        # 新增：指定当前跑第几个组合
+        self.fixed_idx = None 
+
+        self.shared_lock = shared_lock
+
+    def set_task(self, idx):
+        """指定接下来 reset 要跑的组合索引"""
+        self.fixed_idx = idx
+
     def reset(self):
         if self.current_env is not None:
             self.current_env.close()
             self.current_env = None
 
-        pair_info = self.rng.choice(self.all_pairs)
+        # 核心修改：如果有指定任务，就跑指定的；否则随机（防止报错）
+        if self.fixed_idx is not None:
+            # 确保索引不越界
+            idx = self.fixed_idx % len(self.all_pairs)
+            pair_info = self.all_pairs[idx]
+        else:
+            pair_info = random.choice(self.all_pairs)
+            
         t_start = pair_info.get('start_time', self.cfg.start_time)
         t_end = pair_info.get('end_time', self.cfg.end_time)
         
-        # 从共享内存获取数据
         preloaded_data = DataCache.get_data(
-            self.shared_cache, # 传入 Manager.dict
-            benchmark='510050',
-            start_time=t_start,
-            end_time=t_end,
-            init_capital=self.cfg.init_capital,
-            fee=self.cfg.fee
+            self.shared_cache, self.shared_lock, '510050', t_start, t_end,
+            self.cfg.init_capital, self.cfg.fee
         )
         
         self.current_env = windowEnv(
             init_capital=self.cfg.init_capital,
-            call=pair_info['call'],
-            put=pair_info['put'],
-            fee=self.cfg.fee,
-            start_time=t_start,
-            end_time=t_end,
-            benchmark='510050',
-            timesteps=self.cfg.max_timesteps,
-            preloaded_data=preloaded_data
+            call=pair_info['call'], put=pair_info['put'], fee=self.cfg.fee,
+            start_time=t_start, end_time=t_end, benchmark='510050',
+            timesteps=self.cfg.max_timesteps, preloaded_data=preloaded_data
         )
-        
         return self.current_env.reset()
-
-    def step(self, action, weight):
-        if self.current_env is None:
-            return self.reset()
-        return self.current_env.step(action, weight)
-
-    # [修复] 必须显式定义 close 方法，否则 Worker 退出时会报错
-    def close(self):
-        if self.current_env:
-            self.current_env.close()
-
-    @property
-    def account_controller(self):
-        return self.current_env.account_controller
     
-    def get_raw_shape(self):
-        if self.current_env is None:
-            self.reset()
+    # ... 其他方法 (step, close等) 保持不变 ...
+    def step(self, action, weight):
+        if self.current_env is None: return self.reset()
+        return self.current_env.step(action, weight)
+    def close(self):
+        if self.current_env: self.current_env.close()
+    def get_raw_shape(self): # ...不变
+        if self.current_env is None: self.reset()
         return self.current_env.get_raw_shape()
-
+    @property
+    def account_controller(self): return self.current_env.account_controller
 # -----------------------------------------------------------
 # 特征适配器
 # -----------------------------------------------------------
@@ -705,7 +736,6 @@ class Agent:
         self.num_workers = None
 
     # 训练模式初始化
-# 训练模式初始化 - [已修复序列化报错]
     def init_train(self):
         print(f'[Agent-init-train] 期权组合数量 = {len(self.cfg.option_pairs)}')
         config = self.cfg
@@ -714,6 +744,7 @@ class Agent:
         # 1. 启动管理器 (必须在主进程)
         self.manager = mp.Manager()
         self.shared_cache = self.manager.dict() # 创建跨进程共享字典
+        self.share_lock = self.manager.Lock()
         
         # 2. 确定 Worker 数量
         num_workers = min(len(config.option_pairs), config.num_workers)
@@ -731,12 +762,13 @@ class Agent:
         _cache = self.shared_cache
         _pairs = config.option_pairs
         _cfg = config 
+        _lock = self.share_lock
         
         for i in range(num_workers):
             # 使用默认参数绑定 (seed=i, cache=_cache, ...) 
             # 这样函数体内部就不需要引用外部作用域的 self 了
-            def make_env(seed=i, cache=_cache, pairs=_pairs, cfg=_cfg):
-                return DynamicWindowEnv(pairs, cfg, cache, seed=seed)
+            def make_env(seed=i, cache=_cache, lock=_lock, pairs=_pairs, cfg=_cfg):
+                return DynamicWindowEnv(pairs, cfg, cache, lock, seed=seed)
             
             self.env_fns.append(make_env)
         # --- 核心修复结束 ---
@@ -772,8 +804,271 @@ class Agent:
         self.ppo.state_norm = state_norm
         print(f"[Info] Norm设置完成 | state.n = {self.ppo.state_norm.running_ms.n}")
 
-    # 动态并行训练函数
+    # 动态并行训练函数 (全量覆盖版)
     def train_parallel_modified_early_stop(self, from_check_point: bool=False):
+        # 1. 初始化并行环境
+        vec_env = SubprocVectorEnv(self.env_fns)
+        print(f"[Train] Start Full-Coverage training on {self.device}...")
+        
+        best_reward = -float('inf')
+        patience = getattr(self.cfg, 'patience', 30)
+        stop_entropy = getattr(self.cfg, 'stop_entropy', 0.6)
+        min_delta = 0.001
+        early_stop_counter = 0
+
+        # 获取任务总量信息
+        total_pairs = len(self.cfg.option_pairs)
+        num_workers = len(self.env_fns)
+
+
+        if from_check_point:
+            start_epoch, best_reward = self.ppo.load_checkpoint()
+
+        for epoch in range(self.cfg.max_epochs):
+            if from_check_point and start_epoch is not None:
+                if epoch < start_epoch:
+                    print(f'[Skip] epoch = {epoch}')
+                    continue
+
+            print(f'epoch = {epoch}')
+            start_time = time.time()
+            
+            # --- 大容器：用于收集这一轮 Epoch 所有组合的数据 ---
+            # 结构：key -> list of (T个时间步) -> list of (Batch批次)
+            all_traces = {
+                'raw_curr': [], 'raw_hist': [],
+                'actions': [], 'weight_idx': [], 'logp_joint': [], 
+                'rewards': [], 
+                'terminated': [], 'truncated': [],
+                'next_raw_curr': [], 'next_raw_hist': [] 
+            }
+            
+            # 统计变量
+            epoch_rewards_sum = 0.0
+            epoch_equity_sum = 0.0
+            total_steps_collected = 0
+            
+            # ==========================================
+            # [核心逻辑] 分批次跑完所有组合 (Chunk Loop)
+            # ==========================================
+            # 每次 stride = num_workers
+            for i in range(0, total_pairs, num_workers):
+                # 1. 确定当前批次的任务索引
+                # 例如总共93个，Worker=12，则 indices=[0..11], [12..23]...
+                indices = list(range(i, min(i + num_workers, total_pairs)))
+                print(f'Start to collected pairs {indices[0]}-{indices[-1]}')
+                valid_count = len(indices) # 这一批实际有效的任务数
+                
+                # 如果最后一批不足 num_workers 个 (例如剩 5 个)，
+                # 后面的 Worker 也要干活(防止死锁)，可以随机填充任务，但数据后面会丢弃
+                run_indices = indices.copy()
+                while len(run_indices) < num_workers:
+                    run_indices.append(random.randint(0, total_pairs - 1))
+                
+                # 2. 下发任务
+                vec_env.set_tasks(run_indices)
+                
+                # 3. 初始化这一批的 RewardScaler
+                self.ppo.init_norm_reward_list(length=num_workers)
+
+                # 4. Reset 环境
+                curr_np, hist_np, infos = vec_env.reset()
+                
+                # 批次临时容器 (不含 next_state)
+                batch_keys = ['raw_curr', 'raw_hist', 'actions', 'weight_idx', 'logp_joint', 'rewards', 'terminated', 'truncated']
+                batch_data = {k: [] for k in batch_keys}
+                
+                batch_rewards_raw = [] # 用于计算 log reward
+                batch_equities = [0.0] * num_workers
+                
+                # --- 采集循环 (Step Loop) ---
+                for t in range(self.cfg.max_timesteps):
+                    c_tensor = torch.as_tensor(curr_np, dtype=torch.float32, device=self.device)
+                    h_tensor = torch.as_tensor(hist_np, dtype=torch.float32, device=self.device)
+                    
+                    with torch.no_grad():
+                        state = self.ppo.extract_features_batch(c_tensor, h_tensor)
+                        a, w_idx, w_val, _, _, logp_joint = self.ppo.selete_action_and_weight(state)
+                    
+                    actions_np = a.cpu().numpy()
+                    weights_np = w_val.cpu().numpy()
+                    
+                    next_curr, next_hist, rews, terms, truncs, infos = vec_env.step(actions_np, weights_np)
+                    
+                    # 归一化奖励
+                    scaled_rewards = []
+                    for k in range(num_workers):
+                        r = rews[k].item()
+                        r_norm = self.ppo.reward_norm_list[k]
+                        scaled_rewards.append(r_norm(r))
+                    
+                    # 记录 Equity (只记录 valid_count 内的)
+                    for k in range(valid_count):
+                         info = infos[k]
+                         if isinstance(info, dict):
+                            key = 'final_equity' if (terms[k] or truncs[k]) else 'equity'
+                            if key in info: batch_equities[k] = info[key]
+
+                    # 记录 Traces
+                    if t > 0:
+                        batch_data['rewards'].append(torch.as_tensor(scaled_rewards, dtype=torch.float32, device=self.device))
+                        batch_rewards_raw.append(rews)
+
+                    batch_data['raw_curr'].append(c_tensor)
+                    batch_data['raw_hist'].append(h_tensor)
+                    batch_data['actions'].append(a)
+                    batch_data['weight_idx'].append(w_idx)
+                    batch_data['logp_joint'].append(logp_joint)
+                    batch_data['terminated'].append(torch.as_tensor(terms, device=self.device))
+                    batch_data['truncated'].append(torch.as_tensor(truncs, device=self.device)) # 修正之前的 key error
+
+                    curr_np, hist_np = next_curr, next_hist
+                
+                # --- 采集结束，Soft End 补齐 ---
+                hold_actions = np.zeros(num_workers, dtype=int)
+                hold_weights = np.zeros(num_workers, dtype=float)
+                _, _, final_rews, _, _, _ = vec_env.step(hold_actions, hold_weights)
+                
+                batch_data['rewards'].append(torch.as_tensor(final_rews, dtype=torch.float32, device=self.device))
+                batch_rewards_raw.append(final_rews)
+                
+                # --- 将本批次的 Valid 数据合并到 all_traces ---
+                # batch_data[key] 是一个 list，长度 T。元素是 Tensor (Num_Workers, ...)
+                # 我们需要切片取前 valid_count 个 worker，并放入 all_traces 对应的时刻列表中
+                
+                for key in batch_keys:
+                    # 确保 all_traces[key] 有足够的空间 (即 list of T lists)
+                    if len(all_traces[key]) == 0:
+                         all_traces[key] = [[] for _ in range(len(batch_data[key]))]
+                    
+                    for t_idx, tensor in enumerate(batch_data[key]):
+                        # tensor shape: (Num_Workers, ...) -> 切片 -> (Valid_Count, ...)
+                        valid_part = tensor[:valid_count] 
+                        all_traces[key][t_idx].append(valid_part)
+
+                # 处理 Next State (只有 1 个时间步)
+                next_c_valid = torch.as_tensor(curr_np[:valid_count], dtype=torch.float32, device=self.device)
+                next_h_valid = torch.as_tensor(hist_np[:valid_count], dtype=torch.float32, device=self.device)
+                all_traces['next_raw_curr'].append(next_c_valid)
+                all_traces['next_raw_hist'].append(next_h_valid)
+                
+                # 统计
+                # batch_rewards_raw 是 list of numpy (Worker,), 堆叠后求和 valid 部分
+                stacked_rewards = np.stack(batch_rewards_raw) # Shape: (T+1, Num_Workers)
+                raw_rew_sum = np.sum(stacked_rewards[:, :valid_count])
+                # raw_rew_sum = np.sum(np.concatenate(batch_rewards_raw)[:, :valid_count])
+                epoch_rewards_sum += raw_rew_sum
+                epoch_equity_sum += sum(batch_equities[:valid_count])
+                total_steps_collected += self.cfg.max_timesteps * valid_count
+                
+                print(f"  > Batch {i//num_workers + 1}: Collected pairs {indices[0]}-{indices[-1]}")
+
+            # ==========================================
+            # [数据整理] 拼接所有批次的数据
+            # ==========================================
+            # 此时 all_traces['raw_curr'][t] 是一个 list，包含了所有 batch 在时刻 t 的 tensor
+            # 我们需要把它 cat 成一个大 tensor (Total_Pairs, ...)
+            
+            final_traces = {}
+            # 处理时间步序列数据
+            keys_seq = ['raw_curr', 'raw_hist', 'actions', 'weight_idx', 'logp_joint', 'rewards', 'terminated', 'truncated']
+            for key in keys_seq:
+                final_traces[key] = []
+                # 遍历时间步 T
+                for t_list in all_traces[key]:
+                    # t_list 是 [Tensor(Batch1), Tensor(Batch2)...]
+                    combined = torch.cat(t_list, dim=0) # -> Tensor(Total_Pairs, ...)
+                    final_traces[key].append(combined)
+            
+            # 处理 Next State (直接 Cat)
+            final_traces['next_raw_curr'] = torch.cat(all_traces['next_raw_curr'], dim=0)
+            final_traces['next_raw_hist'] = torch.cat(all_traces['next_raw_hist'], dim=0)
+            
+            # --- 统一更新 ---
+            print(f"[Epoch {epoch+1}] Updating on {total_steps_collected} steps (Coverage: {total_pairs} pairs)...")
+            loss, kl, actor_loss, value_loss, entropy = self.ppo.update_parallel(final_traces)
+            
+            # --- Log & Excel ---
+            end_time = time.time()
+            # 这里的 FPS 计算的是每秒采集多少步有效数据
+            fps = total_steps_collected / (end_time - start_time + 1e-8)
+            
+            avg_rew = epoch_rewards_sum / (total_steps_collected + 1e-8) 
+            avg_equity = epoch_equity_sum / total_pairs
+            
+            # 动作统计 (只统计最后一次 batch 的动作分布作为参考，或者统计全部太慢)
+            # 为了性能，这里只统计 all_traces['actions'] 的一部分采样，或者全部
+            # 这里简单统计全部 (在 CPU 上做)
+            with torch.no_grad():
+                # 展平所有动作
+                flat_actions = torch.cat(final_traces['actions']).cpu().numpy().flatten()
+                counts = np.bincount(flat_actions, minlength=4)
+                ratios = counts / (len(flat_actions) + 1e-8)
+
+                flat_weights = torch.cat(final_traces['weight_idx']).cpu().numpy().flatten()
+                w_counts = np.bincount(flat_weights, minlength=5)
+                w_ratios = w_counts / (len(flat_weights) + 1e-8)
+
+            self.records['epoch'].append(epoch + 1)
+            self.records['reward'].append(avg_rew)
+            self.records['avg_equity'].append(avg_equity)
+            self.records['loss'].append(loss)
+            self.records['kl'].append(kl)
+            self.records['actor_loss'].append(actor_loss)
+            self.records['value_loss'].append(value_loss)
+            self.records['entropy'].append(entropy)
+            
+            self.records['hold_ratio'].append(ratios[0])
+            self.records['long_ratio'].append(ratios[1])
+            self.records['short_ratio'].append(ratios[2])
+            self.records['close_ratio'].append(ratios[3])
+            
+            names = ['ratio_0', 'ratio_25', 'ratio_50', 'ratio_75', 'ratio_100']
+            for k in range(len(names)):
+                val = w_ratios[k] if k < len(w_ratios) else 0.0
+                self.records[names[k]].append(val)
+
+            df = pd.DataFrame(self.records)
+            excel_path = f'{DESK_PATH}/PPO_training_data.xlsx'
+            try:
+                df.to_excel(excel_path, index=False)
+            except Exception as e:
+                print(f"[Warning] Save Excel failed: {e}")
+
+            if (epoch + 1) % self.cfg.print_interval == 0:
+                print(f"[Epoch {epoch+1}/{self.cfg.max_epochs}] "
+                      f"Rew: {avg_rew:.4f} | "
+                      f"Val: {avg_equity:.0f} | "
+                      f"Act: H{ratios[0]:.2f}/L{ratios[1]:.2f}/S{ratios[2]:.2f}/C{ratios[3]:.2f} | "
+                      f"Ent: {entropy:.2f} | "
+                      f"KL: {kl:.4f} | "
+                      f"FPS: {fps:.0f}")
+            
+            # --- 早停判断 ---
+            if avg_rew > best_reward + min_delta:
+                best_reward = avg_rew
+                early_stop_counter = 0 
+                self.ppo.save(epoch, best_reward) 
+                print(f"   >>> 🌟 Best Reward Updated: {best_reward:.4f} (Counter Reset)")
+            else:
+                early_stop_counter += 1
+                print(f"   ⏳ [Patience] No improvement: {early_stop_counter}/{patience} | Best: {best_reward:.4f}")
+
+            if early_stop_counter >= patience:
+                print(f"\n🛑 [Early Stop] Triggered! Reward has not improved for {patience} epochs.")
+                print(f"   Final Best Reward: {best_reward:.4f}")
+                break
+            
+            if entropy < stop_entropy and avg_rew > 0:
+                print(f"\n🛑 [Early Stop] Triggered! Entropy ({entropy:.4f}) is too low.")
+                self.ppo.save(epoch, best_reward)
+                break
+
+        print(f"[Train] Finished. Data saved to {excel_path}")
+        vec_env.close()
+
+    # 动态并行训练函数
+    def old_train_parallel_modified_early_stop(self, from_check_point: bool=False):
         # 1. 初始化并行环境
         vec_env = SubprocVectorEnv(self.env_fns)
         print(f"[Train] Start dynamic parallel training on {self.device}...")
@@ -959,8 +1254,8 @@ class Agent:
 # -----------------------------------------------------------
 if __name__ == '__main__':
     if not torch.cuda.is_available():
-        torch.set_num_threads(4)
-        torch.set_num_interop_threads(4)
+        torch.set_num_threads(3)
+        torch.set_num_interop_threads(3)
 
     mp.set_start_method('spawn', force=True) 
 
@@ -1023,7 +1318,7 @@ if __name__ == '__main__':
 
     cfg = AgentConfig(
         action_dim=4, 
-        option_pairs=all_pairs, 
+        option_pairs=all_pairs[0: 2], 
         max_epochs=500,
         max_timesteps=1000, 
         # num_workers=5      
@@ -1031,6 +1326,7 @@ if __name__ == '__main__':
 
     if torch.cuda.is_available():
         cfg.num_workers = cfg.num_workers + 2
+
     
 
     agent = Agent(cfg)

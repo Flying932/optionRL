@@ -17,12 +17,13 @@ def get_all_excel_paths(folder_path: str='./miniQMT/datasets/label_train_data'):
         # 排除临时文件 ~$
         if file.lower().endswith('.xlsx') and not file.startswith('~$'):
             full_path = os.path.join(folder_path, file)
-            excel_paths.append(full_path)
+            if full_path.endswith('_510050.xlsx'):
+                excel_paths.append(full_path)
     return excel_paths
 
 
 class OptionTrainingDataGenerator:
-    def __init__(self, window_size=32, predict_horizon=1, ks_range=(0.9, 1.1), min_ratio: float=0.8):
+    def __init__(self, window_size=32, predict_horizon=1, ks_range=(0.9, 1.1), min_ratio: float=0.8, path: str=None):
         """
         初始化数据生成器
         :param window_size: 历史观察窗口大小 (T)
@@ -34,6 +35,8 @@ class OptionTrainingDataGenerator:
         self.predict_horizon = predict_horizon
         self.min_ks, self.max_ks = ks_range
         self.min_ratio = min_ratio
+
+        self.path = path
         
         # 用于存储处理后的所有样本
         # X: (N, window_size, feature_dim)
@@ -74,6 +77,7 @@ class OptionTrainingDataGenerator:
         if tolerate is None:
             tolerate = self.window_size // 2
 
+        
         # >>> 修正：contract_id 定义 <<<
         idx = file_path.find('.xlsx')
         if idx > 15:
@@ -82,6 +86,8 @@ class OptionTrainingDataGenerator:
         else:
             # 使用文件名作为 ID
             contract_id = os.path.basename(file_path).replace('.xlsx', '')
+        
+        old_len_x = len(self.all_X)
             
         self.unique_contract_ids.add(contract_id)
         # >>> contract_id 定义结束 <<<
@@ -143,8 +149,11 @@ class OptionTrainingDataGenerator:
                 
                 # 调用切片函数
                 self._slice_windows(group_data, group_mask_data, contract_id)
-                
-        print(f"[Success] Loaded {file_path}: Total samples now: {len(self.all_X)}")
+        if len(self.all_X) == old_len_x:
+            self.unique_contract_ids.remove(contract_id)
+            print(f"[Warning] Loaded {file_path}, 但数据无意义, 没有添加~")
+        else:
+            print(f"[Success] Loaded {file_path}: Total samples now: {len(self.all_X)}")
 
 
     def _slice_windows(self, segment_df: pd.DataFrame, segment_mask_df: pd.DataFrame, contract_id: str):
@@ -276,7 +285,10 @@ class OptionTrainingDataGenerator:
     # 直接获取最终的loader
     def get_data_loader(self, train_size: float=0.7, val_size: float=0.2, file_list: str=None, batch_size: int=64, num_workers: int=6):
         if file_list is None:
-            file_list = get_all_excel_paths()
+            if self.path is not None:
+                file_list = get_all_excel_paths(self.path)
+            else:
+                file_list = get_all_excel_paths()
         
         print(f"Start loading {len(file_list)} files...")
         for i, f in enumerate(file_list):
@@ -325,7 +337,7 @@ if __name__ == "__main__":
 
         if generator.all_X:
             (X_train, Y_train), (X_val, Y_val), (X_test, Y_test) = generator.get_split_datasets_by_contract(
-                    train_ratio=0.6, 
+                    train_ratio=0.7, 
                     val_ratio=0.2
                 )
 

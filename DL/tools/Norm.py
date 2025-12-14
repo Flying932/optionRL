@@ -47,6 +47,11 @@ class Normalization:
         # Whether to update the mean and std,during the evaluating,update=Flase
         if update:  
             self.running_ms.update(x)
+
+        # 冷启动
+        if self.running_ms.n == 0:
+            return x
+
         new_x = (x - self.running_ms.mean) / (self.running_ms.std)
         return new_x
 

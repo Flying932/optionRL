@@ -441,6 +441,8 @@ class RealInfo:
 
         return history_iv
 
+    def cal_greeks_raw(self, stock_price, strike, ttm, rate, option_price, op_type, input_iv=None):
+        return self.bs.get_greeks(stock_price, strike, ttm, rate, option_price, op_type, input_iv=None)
 
     # 计算希腊字母
     def cal_greeks(self, 

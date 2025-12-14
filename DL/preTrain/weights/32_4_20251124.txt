@@ -1,0 +1,97 @@
+[Success] Loaded ./miniQMT/datasets/all_label_data/10006737_510050.xlsx: Total samples now: 79353
+
+--- Data Split Summary (By Contract ID) ---
+Total Contracts: 245
+Train Contracts: 171 | Train Samples: 56773 
+Validation Contracts: 49 | Validation Samples: 14189
+Test Contracts: 25 | Test Samples: 8391
+/usr/local/lib/python3.10/dist-packages/torch/utils/data/dataloader.py:617: UserWarning: This DataLoader will create 20 worker processes in total. Our suggested max number of worker in current system is 4, which is smaller than what this DataLoader is going to create. Please be aware that excessive worker creation might get DataLoader running slow or even freeze, lower the worker number to avoid potential slowness/freeze if necessary.
+  warnings.warn(
+/usr/local/lib/python3.10/dist-packages/torch/nn/utils/weight_norm.py:143: FutureWarning: `torch.nn.utils.weight_norm` is deprecated in favor of `torch.nn.utils.parametrizations.weight_norm`.
+  WeightNorm.apply(module, name, dim)
+--- Training preMOE on cuda ---
+Total epochs: 200, Early Stopping Patience: 5 | lookback: 32, pre_len: 4 
+Epoch 01 | Time: 40.67s | Train Loss: 1.834316 | Val MSE: 0.127862 | Val MAE: 3.488466 -> **Saving Best Model**
+Epoch 02 | Time: 40.44s | Train Loss: 0.029654 | Val MSE: 0.121271 | Val MAE: 3.482554 -> **Saving Best Model**
+Epoch 03 | Time: 41.54s | Train Loss: 0.025579 | Val MSE: 0.117967 | Val MAE: 3.419342 -> **Saving Best Model**
+Epoch 04 | Time: 41.41s | Train Loss: 0.021619 | Val MSE: 0.114892 | Val MAE: 3.361038 -> **Saving Best Model**
+Epoch 05 | Time: 41.70s | Train Loss: 0.018226 | Val MSE: 0.109199 | Val MAE: 3.306087 -> **Saving Best Model**
+Epoch 06 | Time: 41.46s | Train Loss: 0.015101 | Val MSE: 0.108992 | Val MAE: 3.364582 -> **Saving Best Model**
+Epoch 07 | Time: 43.74s | Train Loss: 0.012395 | Val MSE: 0.105885 | Val MAE: 3.298902 -> **Saving Best Model**
+Epoch 08 | Time: 353.71s | Train Loss: 0.009934 | Val MSE: 0.099462 | Val MAE: 3.198991 -> **Saving Best Model**
+Epoch 09 | Time: 45.28s | Train Loss: 0.007956 | Val MSE: 0.096358 | Val MAE: 3.194046 -> **Saving Best Model**
+Epoch 10 | Time: 120.71s | Train Loss: 0.006534 | Val MSE: 0.095125 | Val MAE: 3.141178 -> **Saving Best Model**
+Epoch 11 | Time: 40.80s | Train Loss: 0.005592 | Val MSE: 0.087946 | Val MAE: 3.070662 -> **Saving Best Model**
+Epoch 12 | Time: 41.57s | Train Loss: 0.004753 | Val MSE: 0.085612 | Val MAE: 3.052815 -> **Saving Best Model**
+Epoch 13 | Time: 42.52s | Train Loss: 0.004177 | Val MSE: 0.083167 | Val MAE: 3.030259 -> **Saving Best Model**
+Epoch 14 | Time: 434.00s | Train Loss: 0.003703 | Val MSE: 0.077073 | Val MAE: 2.915357 -> **Saving Best Model**
+Epoch 15 | Time: 41.76s | Train Loss: 0.003309 | Val MSE: 0.075575 | Val MAE: 2.895090 -> **Saving Best Model**
+Epoch 16 | Time: 41.26s | Train Loss: 0.003023 | Val MSE: 0.073147 | Val MAE: 2.871774 -> **Saving Best Model**
+Epoch 17 | Time: 41.54s | Train Loss: 0.002740 | Val MSE: 0.069472 | Val MAE: 2.823890 -> **Saving Best Model**
+Epoch 18 | Time: 41.99s | Train Loss: 0.002564 | Val MSE: 0.066609 | Val MAE: 2.765001 -> **Saving Best Model**
+Epoch 19 | Time: 41.14s | Train Loss: 0.002443 | Val MSE: 0.065755 | Val MAE: 2.747577 -> **Saving Best Model**
+Epoch 20 | Time: 41.58s | Train Loss: 0.002304 | Val MSE: 0.061480 | Val MAE: 2.670982 -> **Saving Best Model**
+Epoch 21 | Time: 41.28s | Train Loss: 0.002313 | Val MSE: 0.060705 | Val MAE: 2.642433 -> **Saving Best Model**
+Epoch 22 | Time: 41.79s | Train Loss: 0.002072 | Val MSE: 0.062185 | Val MAE: 2.638085
+Epoch 23 | Time: 41.61s | Train Loss: 0.001961 | Val MSE: 0.058536 | Val MAE: 2.616209 -> **Saving Best Model**
+Epoch 24 | Time: 41.90s | Train Loss: 0.001827 | Val MSE: 0.058422 | Val MAE: 2.598383 -> **Saving Best Model**
+Epoch 25 | Time: 42.23s | Train Loss: 0.001749 | Val MSE: 0.054876 | Val MAE: 2.523689 -> **Saving Best Model**
+Epoch 26 | Time: 41.38s | Train Loss: 0.001684 | Val MSE: 0.053855 | Val MAE: 2.483748 -> **Saving Best Model**
+Epoch 27 | Time: 41.39s | Train Loss: 0.001548 | Val MSE: 0.052386 | Val MAE: 2.453925 -> **Saving Best Model**
+Epoch 28 | Time: 42.34s | Train Loss: 0.001457 | Val MSE: 0.051982 | Val MAE: 2.422972 -> **Saving Best Model**
+Epoch 29 | Time: 41.33s | Train Loss: 0.001382 | Val MSE: 0.050991 | Val MAE: 2.407069 -> **Saving Best Model**
+Epoch 30 | Time: 41.86s | Train Loss: 0.001423 | Val MSE: 0.050025 | Val MAE: 2.413894 -> **Saving Best Model**
+Epoch 31 | Time: 41.79s | Train Loss: 0.001297 | Val MSE: 0.049085 | Val MAE: 2.353607 -> **Saving Best Model**
+Epoch 32 | Time: 41.51s | Train Loss: 0.001219 | Val MSE: 0.047834 | Val MAE: 2.334606 -> **Saving Best Model**
+Epoch 33 | Time: 42.27s | Train Loss: 0.001158 | Val MSE: 0.046963 | Val MAE: 2.302437 -> **Saving Best Model**
+Epoch 34 | Time: 284.49s | Train Loss: 0.001189 | Val MSE: 0.047480 | Val MAE: 2.307449
+Epoch 35 | Time: 42.74s | Train Loss: 0.001120 | Val MSE: 0.046915 | Val MAE: 2.299863 -> **Saving Best Model**
+Epoch 36 | Time: 42.10s | Train Loss: 0.001462 | Val MSE: 0.045676 | Val MAE: 2.271417 -> **Saving Best Model**
+Epoch 37 | Time: 43.43s | Train Loss: 0.001123 | Val MSE: 0.045294 | Val MAE: 2.242035 -> **Saving Best Model**
+Epoch 38 | Time: 42.80s | Train Loss: 0.001036 | Val MSE: 0.046117 | Val MAE: 2.267719
+Epoch 39 | Time: 41.90s | Train Loss: 0.000985 | Val MSE: 0.044132 | Val MAE: 2.198539 -> **Saving Best Model**
+Epoch 40 | Time: 42.99s | Train Loss: 0.000937 | Val MSE: 0.043718 | Val MAE: 2.224896 -> **Saving Best Model**
+Epoch 41 | Time: 45.89s | Train Loss: 0.000912 | Val MSE: 0.043079 | Val MAE: 2.168234 -> **Saving Best Model**
+Epoch 42 | Time: 42.97s | Train Loss: 0.000889 | Val MSE: 0.043451 | Val MAE: 2.199203
+Epoch 43 | Time: 42.54s | Train Loss: 0.000901 | Val MSE: 0.042627 | Val MAE: 2.140522 -> **Saving Best Model**
+Epoch 44 | Time: 42.27s | Train Loss: 0.000911 | Val MSE: 0.041684 | Val MAE: 2.138631 -> **Saving Best Model**
+Epoch 45 | Time: 41.85s | Train Loss: 0.000843 | Val MSE: 0.041334 | Val MAE: 2.129325 -> **Saving Best Model**
+Epoch 46 | Time: 42.78s | Train Loss: 0.001709 | Val MSE: 0.041469 | Val MAE: 2.116484
+Epoch 47 | Time: 43.00s | Train Loss: 0.000979 | Val MSE: 0.040601 | Val MAE: 2.107436 -> **Saving Best Model**
+Epoch 48 | Time: 42.37s | Train Loss: 0.000844 | Val MSE: 0.040553 | Val MAE: 2.093263 -> **Saving Best Model**
+Epoch 49 | Time: 41.50s | Train Loss: 0.000797 | Val MSE: 0.040205 | Val MAE: 2.076401 -> **Saving Best Model**
+Epoch 50 | Time: 44.11s | Train Loss: 0.000780 | Val MSE: 0.039776 | Val MAE: 2.047621 -> **Saving Best Model**
+Epoch 51 | Time: 44.73s | Train Loss: 0.000741 | Val MSE: 0.038851 | Val MAE: 2.038063 -> **Saving Best Model**
+Epoch 52 | Time: 41.58s | Train Loss: 0.000814 | Val MSE: 0.039056 | Val MAE: 2.040500
+Epoch 53 | Time: 249.23s | Train Loss: 0.000746 | Val MSE: 0.039791 | Val MAE: 2.058409
+Epoch 54 | Time: 46.75s | Train Loss: 0.000699 | Val MSE: 0.038539 | Val MAE: 2.025906 -> **Saving Best Model**
+Epoch 55 | Time: 44.45s | Train Loss: 0.000953 | Val MSE: 0.038551 | Val MAE: 2.011781
+Epoch 56 | Time: 1011.56s | Train Loss: 0.001267 | Val MSE: 0.039036 | Val MAE: 2.031236
+Epoch 57 | Time: 44.70s | Train Loss: 0.000841 | Val MSE: 0.036880 | Val MAE: 1.967357 -> **Saving Best Model**
+Epoch 58 | Time: 44.99s | Train Loss: 0.000773 | Val MSE: 0.036972 | Val MAE: 1.954334
+Epoch 59 | Time: 45.49s | Train Loss: 0.000737 | Val MSE: 0.036517 | Val MAE: 1.940635 -> **Saving Best Model**
+Epoch 60 | Time: 43.90s | Train Loss: 0.000748 | Val MSE: 0.037045 | Val MAE: 1.959745
+Epoch 61 | Time: 43.83s | Train Loss: 0.000710 | Val MSE: 0.035774 | Val MAE: 1.926546 -> **Saving Best Model**
+Epoch 62 | Time: 46.37s | Train Loss: 0.000739 | Val MSE: 0.037137 | Val MAE: 1.952156
+Epoch 63 | Time: 45.92s | Train Loss: 0.000693 | Val MSE: 0.036691 | Val MAE: 1.968950
+Epoch 64 | Time: 45.99s | Train Loss: 0.000657 | Val MSE: 0.034847 | Val MAE: 1.889716 -> **Saving Best Model**
+Epoch 65 | Time: 46.26s | Train Loss: 0.000634 | Val MSE: 0.035339 | Val MAE: 1.895495
+Epoch 66 | Time: 45.96s | Train Loss: 0.000615 | Val MSE: 0.034254 | Val MAE: 1.871928 -> **Saving Best Model**
+Epoch 67 | Time: 46.48s | Train Loss: 0.000598 | Val MSE: 0.035341 | Val MAE: 1.883929
+Epoch 68 | Time: 46.50s | Train Loss: 0.000574 | Val MSE: 0.034002 | Val MAE: 1.866599 -> **Saving Best Model**
+Epoch 69 | Time: 44.19s | Train Loss: 0.001143 | Val MSE: 0.035140 | Val MAE: 1.912078
+Epoch 70 | Time: 44.26s | Train Loss: 0.000739 | Val MSE: 0.033131 | Val MAE: 1.835409 -> **Saving Best Model**
+Epoch 71 | Time: 42.91s | Train Loss: 0.000691 | Val MSE: 0.033602 | Val MAE: 1.850070
+Epoch 72 | Time: 42.90s | Train Loss: 0.001014 | Val MSE: 0.034070 | Val MAE: 1.848962
+Epoch 73 | Time: 43.94s | Train Loss: 0.000724 | Val MSE: 0.033156 | Val MAE: 1.845510
+Epoch 74 | Time: 45.45s | Train Loss: 0.000662 | Val MSE: 0.033475 | Val MAE: 1.829198
+Epoch 75 | Time: 47.19s | Train Loss: 0.000635 | Val MSE: 0.033264 | Val MAE: 1.825260
+
+[Early Stop] Validation MSE did not improve for 5 epochs.
+
+--- Final Evaluation ---
+/root/miniQMT/DL/preTrain/preMOE.py:402: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  model.load_state_dict(torch.load(save_path))
+Loaded best model from './miniQMT/DL/preTrain/weights/preMOE_best_dummy_data_32_4_20251214.pth'.
+Test MSE: 0.030099 | Test MAE: 2.074218
+--- Total training finished in 90.85 minutes. ---

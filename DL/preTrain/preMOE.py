@@ -694,11 +694,12 @@ def new_test(lookback: int=32, pre_len: int=4):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     model = PreMOE(seq_len=LOOKBACK, pred_len=HORIZON, n_variates=C_IN, d_router=D_ROUTER).to(device)
-    SAVE_PATH = f'./miniQMT/DL/preTrain/weights/preMOE_best_dummy_data_{lookback}_{pre_len}.pth'
+    SAVE_PATH = f'./miniQMT/DL/preTrain/weights/preMOE_best_dummy_data_{lookback}_{pre_len}_20251214_2.pth'
     state_dict = torch.load(SAVE_PATH, map_location=device)
     model.load_state_dict(state_dict)
-    output_dir = f'./miniQMT/datasets/results_test_{lookback}_{pre_len}_2024'
+    output_dir = f'./miniQMT/datasets/results_test_{lookback}_{pre_len}_20251214'
     data_dir = './miniQMT/datasets/test_label_train_data'
+    data_dir = './miniQMT/datasets/all_label_data'
 
     evaluate_and_plot_results(model, start_idx=0, output_dir=output_dir, lookback=LOOKBACK, pre_len=HORIZON, data_dir=data_dir)
 
@@ -746,7 +747,7 @@ def main(lookback: int=32, pre_len: int=4, batch_size: int=256, num_workers: int
 
 
 if __name__ == "__main__":
-    new_test()
+    new_test(48, 4)
     # lookback_list = [32, 48, 64, 96, 80, 128]
     # pre_len_list = [4, 6, 8, 10, 12]
 

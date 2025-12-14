@@ -1,6 +1,22 @@
-本数据集是510050所有期权的加标签的数据集。
-按照期权到期日进行了分类。
+    option_list = account.get_option_list(target, '202412', 'call')
+    option_list.extend(account.get_option_list(target, '202412', 'put'))
 
-本数据集的特点是，给期权加上了很多特征标签：相对行权价、希腊字母、HV160等。排除了初始虚值实值程度很高的期权、排除了流动性低的期权。
+    option_list.extend(account.get_option_list(target, '202411', 'call'))
+    option_list.extend(account.get_option_list(target, '202411', 'put'))
 
-本数据集可以用来进行预测模型基座的训练。
+
+    option_list.extend(account.get_option_list(target, '202410', 'call'))
+    option_list.extend(account.get_option_list(target, '202410', 'put'))
+    
+    option_list.extend(account.get_option_list(target, '202409', 'call'))
+    option_list.extend(account.get_option_list(target, '202409', 'put'))
+
+    option_list.extend(account.get_option_list(target, '202408', 'call'))
+    option_list.extend(account.get_option_list(target, '202408', 'put'))
+
+
+    option_list.extend(account.get_option_list(target, '202407', 'call'))
+    option_list.extend(account.get_option_list(target, '202407', 'put'))
+
+    option_list.extend(account.get_option_list(target, '202406', 'call'))
+    option_list.extend(account.get_option_list(target, '202406', 'put'))

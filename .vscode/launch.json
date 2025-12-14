@@ -1,0 +1,23 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: 强制在家目录运行",
+            "type": "debugpy",
+            "request": "launch",
+            
+            // 1. 指定代码文件位置 (保持不变)
+            "program": "${file}",
+
+            // 2. 🔥 核心修改：这里不要用 ${workspaceFolder}，直接写死 "/root"
+            "cwd": "/root",
+
+            "console": "integratedTerminal",
+            "justMyCode": false,
+            "subProcess": true,
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            }
+        }
+    ]
+}

@@ -1057,6 +1057,7 @@ class AgentConfig:
 class Agent:
     def __init__(self, cfg: AgentConfig):
         self.cfg = cfg
+        self.cfg.pretrained_path = f"./miniQMT/DL/preTrain/weights/preMOE_best_dummy_data_{cfg.window_size}_{cfg.pre_len}.pth"
         self.device = cfg.device
         self.pairs = cfg.option_pairs
         assert len(self.pairs) > 0, "option_pairs is empty"
@@ -1668,7 +1669,9 @@ if __name__ == "__main__":
     option_pairs = all_pairs
     cfg = AgentConfig(
         option_pairs=option_pairs,
-        pretrained_path="./miniQMT/DL/preTrain/weights/preMOE_best_dummy_data_32_4.pth",
+        # pretrained_path="./miniQMT/DL/preTrain/weights/preMOE_best_dummy_data_32_4.pth",
+        window_size=32,
+        pre_len=4,
         epochs=500,
         rollout_T=8192,
         num_workers=10,

@@ -5,10 +5,55 @@ from typing import List, Dict, Optional, Tuple
 import pandas as pd
 from datetime import datetime, time, timedelta
 
-try:
-    from finTool.BS import BS
-except Exception as _:
-    from BS import BS
+
+import sys
+from pathlib import Path
+
+def setup_miniqmt_import_root():
+    """
+    递归查找 'miniQMT' 文件夹，并将其添加到 sys.path 中，
+    从而允许使用 miniQMT 为根的绝对导入。
+    """
+    
+    # 1. 获取当前脚本的绝对路径
+    # stack[0] 是当前正在执行的帧，其 f_globals['__file__'] 是脚本路径
+    try:
+        # 获取调用此函数的脚本的路径
+        calling_script_path = Path(sys._getframe(1).f_globals['__file__']).resolve()
+    except KeyError:
+        # 如果在交互式环境或某些特殊环境中，可能无法获取文件路径，则退出
+        print("⚠️ 警告: 无法确定当前脚本路径，跳过路径设置。")
+        return
+    
+    current_path = calling_script_path
+    miniqmt_root = None
+    
+    # 2. 向上递归查找
+    # current_path.parents 是一个包含所有父目录的序列
+    for parent in [current_path] + list(current_path.parents):
+        if parent.name == 'miniQMT':
+            miniqmt_root = parent
+            break
+        
+    # 3. 检查并添加路径
+    if miniqmt_root:
+        # 将找到的 miniQMT 目录添加到 sys.path
+        miniqmt_root_str = str(miniqmt_root)
+        if miniqmt_root_str not in sys.path:
+            sys.path.insert(0, miniqmt_root_str)
+            print(f"✅ 成功将项目根目录添加到搜索路径: {miniqmt_root_str}")
+        else:
+            # 已经添加过，无需重复添加
+            print(f"ℹ️ 项目根目录已在搜索路径中: {miniqmt_root_str}")
+    else:
+        print("❌ 错误: 未能在当前路径或其任何父目录中找到 'miniQMT' 文件夹。")
+
+setup_miniqmt_import_root()
+from DL.finTool.BS import BS
+# try:
+#     from DL.finTool.BS import BS
+# except Exception as _:
+#     from BS import BS
 
 import numpy as np
 

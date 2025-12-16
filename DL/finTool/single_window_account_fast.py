@@ -16,13 +16,52 @@ from collections import deque
 import warnings
 from datetime import timedelta, datetime
 
-# 引入包 (根据你的文件结构保持不变)
-if __name__ != '__main__':
-    from finTool.optionBaseInfo import optionBaseInfo
-    from finTool.realInfo import RealInfo
-else:
-    from optionBaseInfo import optionBaseInfo
-    from realInfo import RealInfo
+import sys
+from pathlib import Path
+
+def setup_miniqmt_import_root():
+    """
+    递归查找 'miniQMT' 文件夹，并将其添加到 sys.path 中，
+    从而允许使用 miniQMT 为根的绝对导入。
+    """
+    
+    # 1. 获取当前脚本的绝对路径
+    # stack[0] 是当前正在执行的帧，其 f_globals['__file__'] 是脚本路径
+    try:
+        # 获取调用此函数的脚本的路径
+        calling_script_path = Path(sys._getframe(1).f_globals['__file__']).resolve()
+    except KeyError:
+        # 如果在交互式环境或某些特殊环境中，可能无法获取文件路径，则退出
+        print("⚠️ 警告: 无法确定当前脚本路径，跳过路径设置。")
+        return
+    
+    current_path = calling_script_path
+    miniqmt_root = None
+    
+    # 2. 向上递归查找
+    # current_path.parents 是一个包含所有父目录的序列
+    for parent in [current_path] + list(current_path.parents):
+        if parent.name == 'miniQMT':
+            miniqmt_root = parent
+            break
+        
+    # 3. 检查并添加路径
+    if miniqmt_root:
+        # 将找到的 miniQMT 目录添加到 sys.path
+        miniqmt_root_str = str(miniqmt_root)
+        if miniqmt_root_str not in sys.path:
+            sys.path.insert(0, miniqmt_root_str)
+            print(f"✅ 成功将项目根目录添加到搜索路径: {miniqmt_root_str}")
+        else:
+            # 已经添加过，无需重复添加
+            print(f"ℹ️ 项目根目录已在搜索路径中: {miniqmt_root_str}")
+    else:
+        print("❌ 错误: 未能在当前路径或其任何父目录中找到 'miniQMT' 文件夹。")
+setup_miniqmt_import_root()
+
+from DL.finTool.optionBaseInfo import optionBaseInfo
+from DL.finTool.realInfo import RealInfo
+
 
 # ========================== 数据结构 ==========================
 @dataclass(slots=True)
@@ -115,6 +154,26 @@ class single_Account:
         self.volume_cache = {}
         self.margin_cache = {}
         self.greek_cache = {} 
+
+    # 新添加的两个函数
+    def ensure_combos_loaded(self, call: str, put: str, start_time: str=None, end_time: str=None):
+        """Set comb legs if changed; optionally preload greek/price caches for [start_time, end_time]."""
+        curr_call = self.comb.get('call', None)
+        curr_put  = self.comb.get('put', None)
+        if curr_call != call or curr_put != put:
+            self.set_combos(call, put)
+            if start_time is not None and end_time is not None:
+                self.preload_data(start_time, end_time)
+
+
+    def init_state_with_pair(self, time_str: str, close: float, call: str, put: str,
+                            start_time: str=None, end_time: str=None):
+        """
+        Safe wrapper: ensure comb legs are set (and optionally preloaded), then run the original init_state.
+        This avoids the issue where init_state expects self.comb['call'/'put'] already set.
+        """
+        self.ensure_combos_loaded(call, put, start_time, end_time)
+        return self.init_state(time_str, close)
 
     def set_combos(self, call: str, put: str):
         self.comb['call'] = call

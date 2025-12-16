@@ -208,6 +208,22 @@ def get_condition_list(target: str='510050'):
     option_list.extend(account.get_option_list(target, '202406', 'call'))
     option_list.extend(account.get_option_list(target, '202406', 'put'))
 
+    option_list.extend(account.get_option_list(target, '202405', 'call'))
+    option_list.extend(account.get_option_list(target, '202405', 'put'))
+    
+    option_list.extend(account.get_option_list(target, '202404', 'call'))
+    option_list.extend(account.get_option_list(target, '202404', 'put'))
+    
+    option_list.extend(account.get_option_list(target, '202403', 'call'))
+    option_list.extend(account.get_option_list(target, '202403', 'put'))
+    
+    option_list.extend(account.get_option_list(target, '202402', 'call'))
+    option_list.extend(account.get_option_list(target, '202402', 'put'))
+    
+    option_list.extend(account.get_option_list(target, '202401', 'call'))
+    option_list.extend(account.get_option_list(target, '202401', 'put'))
+    
+
     return option_list
 
 if __name__ == '__main__':
@@ -220,6 +236,7 @@ if __name__ == '__main__':
             continue 
         target_lis.append(op)
 
+    print(f'total_length = {len(target_lis)}')
     gen_data_from_choice(target_lis, 'sh', start_idx=0)
 
     print(0 / 0)

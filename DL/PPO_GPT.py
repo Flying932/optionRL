@@ -5,7 +5,9 @@
     1. DynamicWindowEnv 增加 close 方法，修复 AttributeError。
     2. DataCache 使用 multiprocessing.Manager 共享内存，解决多进程重复读取导致的 Miss 刷屏。
 
-    这个是2025.12.14版本, 目前已经实现了多线程, 整个rollout更新的操作
+    这个是2025.12.16版本
+    * 目前已经实现了多线程, 整个rollout更新的操作
+    * 目前实现前50epoch的warm-up(fee=0), 后面fee=1.3
 """
 
 import torch
@@ -533,6 +535,8 @@ def worker(remote, parent_remote, env_fn_wrapper, worker_cfg: Dict[str, Any]):
             elif cmd == 'set_fee':
                 new_fee = float(data)
                 env.set_fee(new_fee)
+
+                remote.send(("ok", None))
 
             elif cmd == "set_weights":
                 payload = data
@@ -1960,8 +1964,8 @@ class Agent:
                 current_fee = target_fee
                 if ep == 50:
                     print(f"[Warmup] Fee warmup ended. Restored to {target_fee}.")
-            
-            self.vec_env.set_fee_all(current_fee)
+            if ep == 0 or ep == 50:
+                self.vec_env.set_fee_all(current_fee)
 
             # 本轮累计的组 steps（按你要求用“组内 steps 总和”来判断是否够 8192）
             sampled_steps_sum = 0

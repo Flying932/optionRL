@@ -16,52 +16,13 @@ from collections import deque
 import warnings
 from datetime import timedelta, datetime
 
-import sys
-from pathlib import Path
-
-def setup_miniqmt_import_root():
-    """
-    递归查找 'miniQMT' 文件夹，并将其添加到 sys.path 中，
-    从而允许使用 miniQMT 为根的绝对导入。
-    """
-    
-    # 1. 获取当前脚本的绝对路径
-    # stack[0] 是当前正在执行的帧，其 f_globals['__file__'] 是脚本路径
-    try:
-        # 获取调用此函数的脚本的路径
-        calling_script_path = Path(sys._getframe(1).f_globals['__file__']).resolve()
-    except KeyError:
-        # 如果在交互式环境或某些特殊环境中，可能无法获取文件路径，则退出
-        print("⚠️ 警告: 无法确定当前脚本路径，跳过路径设置。")
-        return
-    
-    current_path = calling_script_path
-    miniqmt_root = None
-    
-    # 2. 向上递归查找
-    # current_path.parents 是一个包含所有父目录的序列
-    for parent in [current_path] + list(current_path.parents):
-        if parent.name == 'miniQMT':
-            miniqmt_root = parent
-            break
-        
-    # 3. 检查并添加路径
-    if miniqmt_root:
-        # 将找到的 miniQMT 目录添加到 sys.path
-        miniqmt_root_str = str(miniqmt_root)
-        if miniqmt_root_str not in sys.path:
-            sys.path.insert(0, miniqmt_root_str)
-            print(f"✅ 成功将项目根目录添加到搜索路径: {miniqmt_root_str}")
-        else:
-            # 已经添加过，无需重复添加
-            print(f"ℹ️ 项目根目录已在搜索路径中: {miniqmt_root_str}")
-    else:
-        print("❌ 错误: 未能在当前路径或其任何父目录中找到 'miniQMT' 文件夹。")
-setup_miniqmt_import_root()
-
-from DL.finTool.optionBaseInfo import optionBaseInfo
-from DL.finTool.realInfo import RealInfo
-
+# 引入包 (根据你的文件结构保持不变)
+if __name__ != '__main__':
+    from finTool.optionBaseInfo import optionBaseInfo
+    from finTool.realInfo import RealInfo
+else:
+    from optionBaseInfo import optionBaseInfo
+    from realInfo import RealInfo
 
 # ========================== 数据结构 ==========================
 @dataclass(slots=True)
@@ -142,6 +103,7 @@ class single_Account:
         self.cash_ratio = 1.0
         self.margin_ratio = 0.0
         self.target_gain = 0.0
+        self.prev_equity = float(init_capital)
         self.eps = 1e-6
         self.info = {"message": "initial"}
 
@@ -154,26 +116,6 @@ class single_Account:
         self.volume_cache = {}
         self.margin_cache = {}
         self.greek_cache = {} 
-
-    # 新添加的两个函数
-    def ensure_combos_loaded(self, call: str, put: str, start_time: str=None, end_time: str=None):
-        """Set comb legs if changed; optionally preload greek/price caches for [start_time, end_time]."""
-        curr_call = self.comb.get('call', None)
-        curr_put  = self.comb.get('put', None)
-        if curr_call != call or curr_put != put:
-            self.set_combos(call, put)
-            if start_time is not None and end_time is not None:
-                self.preload_data(start_time, end_time)
-
-
-    def init_state_with_pair(self, time_str: str, close: float, call: str, put: str,
-                            start_time: str=None, end_time: str=None):
-        """
-        Safe wrapper: ensure comb legs are set (and optionally preloaded), then run the original init_state.
-        This avoids the issue where init_state expects self.comb['call'/'put'] already set.
-        """
-        self.ensure_combos_loaded(call, put, start_time, end_time)
-        return self.init_state(time_str, close)
 
     def set_combos(self, call: str, put: str):
         self.comb['call'] = call
@@ -557,19 +499,57 @@ class single_Account:
             self.positions[code] = (direction, volume, price * volume * mul)
 
     def _update_comb_equity(self):
-        total_value = 0
+        """
+        仅负责更新：当前净值、持仓组合状态、资金利用率。
+        不负责计算收益率 (target_gain)，收益率由 step 函数统一控制。
+        """
+        total_value = 0.0
+        # 1. 计算持仓市值
         for code, (direction, volume, value) in self.positions.items():
-            signed_val = value if direction == '买入开仓' else -value
-            total_value += signed_val
+            # 买入开仓 value 为正，卖出开仓 value 为负 (在 equity 计算中)
+            # 但注意：optionBaseInfo 里的 value 通常是 (Price * Vol * Mul)，是正数
+            # 你的 dispose_order 里存的 value 是正数
+            
+            # 修正逻辑：
+            # 如果是 Long，市值是 +Value
+            # 如果是 Short，市值是 -Value (因为是负债)
+            # 但通常 equity = Cash + Value(Long) - Value(Short)
+            
+            # 你的 dispose_order 里：
+            # Long: free -cost, value = +cost
+            # Short: free +price, value = +price
+            # 所以 Equity = free + frozen + (Long_Value - Short_Value) ??
+            # 不，你的逻辑里：
+            # Long: free 减少，Position 有价值。
+            # Short: free 增加(卖得钱)，frozen 增加(保证金)，Position 是负债。
+            
+            # 让我们沿用你原代码的逻辑：
+            # signed_val = value if direction == '买入开仓' else -value
+            # 这通常是对的，但在期权卖方里，卖出的钱已经进了 free_money。
+            # 卖方持仓的“市值”是此时平仓需要花的钱（负值）。
+            
+            if direction == '买入开仓':
+                total_value += value
+            elif direction == '卖出开仓':
+                total_value -= value # 卖方持仓是负债
+        
         self.equity = self.free_money + self.frozen_money + total_value
 
-        last_equity = self.equity
-        self.equity_gain = self.equity - last_equity
-        self.cash_ratio = 0.0 if abs(self.equity) < self.eps else (self.free_money / self.equity)
-        self.margin_ratio = 0.0 if abs(self.equity) < self.eps else (self.frozen_money / self.equity)
+        # 2. 更新组合状态标签 (Call/Put Pair)
+        call, put = self.comb['call'], self.comb['put']
+        p_dir, p_size = self.get_pair_position(call, put)
+        self.comb['pos_dir'] = p_dir
+        self.comb['pos_size'] = p_size
+
+        # 3. 更新风控指标
+        # 避免除以 0
+        denom = self.equity if abs(self.equity) > 1e-6 else 1.0
+        self.cash_ratio = self.free_money / denom
+        self.margin_ratio = self.frozen_money / denom
         self.equity_peak = max(self.equity_peak, self.equity)
 
     def update_positions(self, time_str: str):
+        # 根据最新价格更新持仓市值
         delete_list = []
         for code, (direction, volume, _) in list(self.positions.items()):
             if len(code) != 8: continue
@@ -604,13 +584,13 @@ class single_Account:
             self.positions.pop(code, None)
 
         self._update_position_values(time_str)
-        self._update_comb_equity()
         self.frozen_money = 0 if abs(self.frozen_money) < self.eps else self.frozen_money
         self.free_money = 0 if abs(self.free_money) < self.eps else self.free_money
         self.frozen_money_list.append(self.frozen_money)
         self.free_money_list.append(self.free_money)
 
     def simulate_fill(self, time_str: str):
+        # 处理成交，扣除手续费，变动现金
         if self.has_disposed_id >= len(self.Orders) - 1: return
         for order in self.Orders[self.has_disposed_id + 1:]:
             self.has_disposed_id += 1
@@ -699,8 +679,6 @@ class single_Account:
                 order.status = '废单'
                 order.info = '目前暂不交易股票'
 
-        self._update_position_values(time_str)
-        self._update_comb_equity()
 
     def out_excel(self):
         if len(self.time_list) <= 0: return
@@ -737,14 +715,20 @@ class single_Account:
     # ================= 强化学习接口 =================
 
     def step(self, action, weight, ts, close):
-        # 1. 更新环境状态 (走极速缓存)
+        # 1. 【关键】记录 Step 开始时的净值
+        # 注意：这里取的是上一步结束时的净值
+        step_start_equity = self.equity
+
+        # 2. 更新环境基础数据 (价格变动 -> 净值变动)
+        # init_state 内部会调用 _update_comb_equity，更新因价格波动导致的市值变化
         self.init_state(ts, close)
         
-        # 2. 模拟撮合
+        # 3. 模拟撮合 (处理上一时刻的挂单 -> 现金/持仓变动 -> 净值变动)
+        # 内部会调用 _update_comb_equity
         self.simulate_fill(ts)
         
-        # 3. 执行 Action
-        c_id = 0
+        # 4. 执行 Action (挂新单 -> 此时净值通常不变，除非有立即成交逻辑，目前代码是挂单制)
+        c_id = -1
         call, put = self.comb['call'], self.comb['put']
         
         if action == 1: # Long
@@ -756,15 +740,32 @@ class single_Account:
         elif action == 3: # Close
             self.close_pair(ts, call, put, w=weight, c_id=c_id)
         
-        # 4. 更新持仓与净值
+        # 5. 更新持仓与净值 (处理到期/行权 -> 净值变动)
+        # 内部会调用 _update_comb_equity
         self.update_positions(ts)
+
+        # 5.1【新增】在这里统一结算本 Step 的最终权益
+        self._update_comb_equity()
         
-        # 5. 返回
+        # 6. 【关键修复】计算本 Step 的总收益率 (Target Gain)
+        # 此时 self.equity 是本步结束时的最终净值
+        denom = step_start_equity if abs(step_start_equity) > 1e-6 else 1.0
+        self.target_gain = (self.equity - step_start_equity) / denom
+        
+        # 7. 记录数据
+        self.equity_list.append(self.equity) 
+        self.time_list.append(ts)
+        self.target_gain_list.append(self.target_gain) # 方便后续画图
+
+        # 8. 返回状态和奖励
+        # 注意：get_total_state 内部会用到刚刚计算好的 self.target_gain
         curr, hist = self.get_total_state()
         reward = self.getReward(action)
         truncated = self.if_truncated()
         
         return curr, hist, reward, truncated
+
+
 
     def init_state(self, time_str: str, close: float):
         """仅查表，不计算，极速"""
@@ -863,7 +864,6 @@ class single_Account:
         return current_state, self.get_history_state()
 
 
-    
     def getReward(self, action: int, eps: float=1e-6):
             # 1. 基础收益 (Log Return)
             if len(self.equity_list) <= 1:
@@ -886,18 +886,24 @@ class single_Account:
             
             # 方案 B (推荐): 简单的波动率惩罚 (Risk Adjusted)
             # 如果收益是负的，给予额外惩罚
+            k1 = 0
             if step_ret < 0:
+                k1 = 0.5 * final_reward
                 final_reward *= 1.5 # 亏钱时痛感加倍
 
             # 3. 破产/大回撤 终止惩罚 (这是稀疏信号，给重一点没事)
+            k2 = 0
             if self.equity < self.init_capital * 0.6:
-                final_reward -= 100.0 # 暴击
+                final_reward -= 5 # 暴击
+                k2 = -100
             
             # 4. 鼓励持仓 (可选，防止学成一直空仓)
+            k3 = 0
             if action == 0 and self.has_positions():
                final_reward += 0.001 
+               k3 = 0.001
             
-            print(f"base = {base}, final = {final_reward}")
+            # print(f"base = {base}, 负值惩罚: {k1}, 破产惩罚: {k2}, 鼓励持仓: {k3}, final = {final_reward}")
 
             return float(final_reward)
 
@@ -1033,6 +1039,6 @@ if __name__ == '__main__':
             react_state, state, reward, truncated = account.step(0, 0, ts, close)
 
         
-    print(0 / 0)
+    # print(0 / 0)
 
     # account.out_excel()

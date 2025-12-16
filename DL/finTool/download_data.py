@@ -48,14 +48,14 @@ def gen_option_data(optionCode: str, k: str='30', market: str='sh'):
     time.sleep(3)
 
     # 1. 输入框
-    search_img = f'./DL/finTool/pics/search_button.png'
+    search_img = f'./miniQMT/DL/finTool/pics/search_button.png'
     # 如果找不到，这里直接报错，跳到外层 except
     pos = safe_locate(search_img, confidence=0.9, intent="寻找输入框") 
     pg.click(pos)
     pg.write(optionCode, interval=0.05)
     
     # 2. 搜索按钮
-    find_img = f'./DL/finTool/pics/find.png'
+    find_img = f'./miniQMT/DL/finTool/pics/find.png'
     pos = safe_locate(find_img, confidence=0.9, intent="点击搜索按钮")
     pg.click(pos)
     
@@ -63,10 +63,10 @@ def gen_option_data(optionCode: str, k: str='30', market: str='sh'):
 
     # 3. 市场选择
     if market == 'sh':
-        market_img = f'./DL/finTool/pics/sh.png'
+        market_img = f'./miniQMT/DL/finTool/pics/sh.png'
         market_name = "上海市场(sh)"
     else:
-        market_img = f'./DL/finTool/pics/sz.png'
+        market_img = f'./miniQMT/DL/finTool/pics/sz.png'
         market_name = "深圳市场(sz)"
     
     pos = safe_locate(market_img, confidence=0.85, intent=f"选择{market_name}")
@@ -75,21 +75,21 @@ def gen_option_data(optionCode: str, k: str='30', market: str='sh'):
     time.sleep(3)
 
     # 4. 时间周期
-    time_interval = f'./DL/finTool/pics/{k}.png'
+    time_interval = f'./miniQMT/DL/finTool/pics/{k}.png'
     pos = safe_locate(time_interval, confidence=0.9, intent=f"选择时间周期 {k}")
     pg.click(pos)
     
     time.sleep(1)
 
     # 5. 导出数据菜单
-    gen_data = f'./DL/finTool/pics/gendata2.png'
+    gen_data = f'./miniQMT/DL/finTool/pics/gendata2.png'
     pos = safe_locate(gen_data, confidence=0.80, intent="点击导出数据菜单")
     pg.click(pos)
     
     time.sleep(0.5)
 
     # 6. 确认导出
-    gen = f'./DL/finTool/pics/gen.png'
+    gen = f'./miniQMT/DL/finTool/pics/gen.png'
     pos = safe_locate(gen, confidence=0.9, intent="点击确认导出")
     pg.click(pos)
     
@@ -97,7 +97,7 @@ def gen_option_data(optionCode: str, k: str='30', market: str='sh'):
 
     # 7. 检查是否有“无数据”弹窗 
     # (特殊情况：这个找不到是好事，不能用 safe_locate 报错)
-    no_data = f'./DL/finTool/pics/no_data.png'
+    no_data = f'./miniQMT/DL/finTool/pics/no_data.png'
     try:
         # 这里单独 try，因为找不到是正常的
         pos = pg.locateCenterOnScreen(no_data, confidence=0.9)
@@ -110,8 +110,8 @@ def gen_option_data(optionCode: str, k: str='30', market: str='sh'):
         # 如果没数据会弹窗阻挡后续操作，这里可能需要额外的处理逻辑
 
     # 8. 保存/取消按钮
-    # save_and_cancel = f'./DL/finTool/pics/save_K.png'
-    # save_and_cancel = f'./DL/finTool/pics/save_and_cancel.png'
+    # save_and_cancel = f'./miniQMT/DL/finTool/pics/save_K.png'
+    # save_and_cancel = f'./miniQMT/DL/finTool/pics/save_and_cancel.png'
     # pos = safe_locate(save_and_cancel, confidence=0.85, intent="点击保存位置")
     
     # x, y = pos

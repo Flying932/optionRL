@@ -200,7 +200,7 @@ class RollStraddleBase(StrategyBase):
         self.pending_roll_to = None
 
     def _pair_flat(self, account: single_Account, pair: Pair) -> bool:
-        return (not account.has_positions(pair.call)) and (not account.has_positions(pair.put))
+        return (not account.has_positions()) and (not account.has_positions(pair.put))
 
     def _need_roll(self, ts_str: str) -> bool:
         if not self.pair:

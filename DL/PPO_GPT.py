@@ -5,9 +5,7 @@
     1. DynamicWindowEnv 增加 close 方法，修复 AttributeError。
     2. DataCache 使用 multiprocessing.Manager 共享内存，解决多进程重复读取导致的 Miss 刷屏。
 
-    这个是2025.12.16版本
-    * 目前已经实现了多线程, 整个rollout更新的操作
-    * 目前实现前50epoch的warm-up(fee=0), 后面fee=1.3
+    这个是2025.12.14版本, 目前已经实现了多线程, 整个rollout更新的操作
 """
 
 import torch
@@ -1460,7 +1458,7 @@ class LearnerPPO:
                 value_loss = F.mse_loss(v_pred, ret_b)
 
                 entropy = ent_a + 0.5 * ent_w
-                loss = actor_loss + 0.5 * value_loss - 0.001 * entropy
+                loss = actor_loss + 0.5 * value_loss - 0.005 * entropy
 
                 # backward
                 self.opt_adapter.zero_grad(set_to_none=True)
@@ -1809,7 +1807,7 @@ class Agent:
         # 0) 基本参数
         # -------------------------
         total_pairs = len(self.pairs)
-        print(f'[Agent-init-train] 期权组合数量 = {total_pairs}')
+        print(f'[Agent-init-train] 期权组合数量 = {total_pairs} | 进程数量 = {self.cfg.num_workers}')
         current_time = datetime.now()
         formatted_time_string = current_time.strftime("%Y-%m-%d %H:%M:%S")
 
@@ -1952,20 +1950,20 @@ class Agent:
                 continue
 
             t0 = time.time()
-
-            target_fee = self.cfg.fee  # 也就是 1.3
-            
-            # 策略：前 50 个 Epoch 手续费为 0，之后恢复正常
+        
+            # 阶梯式 Fee Warm-up
             if ep < 50:
                 current_fee = 0.0
-                if ep == 0:
-                    print("[Warmup] Fee set to 0.0 for warmup phase.")
+            elif ep < 100:
+                current_fee = 0.3  # 先给点小压力
+            elif ep < 150:
+                current_fee = 0.6
             else:
-                current_fee = target_fee
-                if ep == 50:
-                    print(f"[Warmup] Fee warmup ended. Restored to {target_fee}.")
-            if ep == 0 or ep == 50:
-                self.vec_env.set_fee_all(current_fee)
+                current_fee = self.cfg.fee # 最终 1.3
+            
+            if ep % 50 == 0: # 每50轮打印并同步一次即可
+                 print(f"[Curriculum-warmup] Set Fee to {current_fee}")
+                 self.vec_env.set_fee_all(current_fee)
 
             # 本轮累计的组 steps（按你要求用“组内 steps 总和”来判断是否够 8192）
             sampled_steps_sum = 0
@@ -2132,7 +2130,12 @@ class Agent:
 
             # 保存 Excel
             if getattr(self.cfg, "save_excel", False):
-                pd.DataFrame(self.records).to_excel(self.cfg.excel_path, index=False)
+                if from_check_point is False:
+                    pd.DataFrame(self.records).to_excel(self.cfg.excel_path, index=False)
+                else:
+                    df_old = pd.read_excel(self.cfg.excel_path)
+                    df_combined = pd.concat([df_old, pd.DataFrame(self.records)], ignore_index=True)
+                    df_combined.to_excel(self.cfg.excel_path, index=False)
 
             # --- 早停判断 ---
             if avg_reward > best_reward + min_delta:
@@ -2244,7 +2247,7 @@ if __name__ == "__main__":
         rollout_T=12288*2.5,
         num_workers=17,
         save_excel=True,
-        mini_batch=2048 * 4 * 3,
+        mini_batch=2048 * 12,
     )
 
     agent = Agent(cfg)

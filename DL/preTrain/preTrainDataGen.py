@@ -75,9 +75,9 @@ class OptionTrainingDataGenerator:
         包含了 contract_id 的定义，以及 LOCF 填充和 R_threshold 过滤逻辑。
         """
         if tolerate is None:
-            tolerate = self.window_size // 2
-
+            tolerate = max(min(1, self.window_size * 0.15), 8)
         
+
         # >>> 修正：contract_id 定义 <<<
         idx = file_path.find('.xlsx')
         if idx > 15:
@@ -283,7 +283,7 @@ class OptionTrainingDataGenerator:
 
 
     # 直接获取最终的loader
-    def get_data_loader(self, train_size: float=0.7, val_size: float=0.2, file_list: str=None, batch_size: int=64, num_workers: int=6):
+    def get_data_loader(self, train_size: float=0.7, val_size: float=0.2, file_list: str=None, batch_size: int=64, num_workers: int=6, tolerate: int=4):
         if file_list is None:
             if self.path is not None:
                 file_list = get_all_excel_paths(self.path)
@@ -292,7 +292,7 @@ class OptionTrainingDataGenerator:
         
         print(f"Start loading {len(file_list)} files...")
         for i, f in enumerate(file_list):
-            self.load_and_process_file(f)
+            self.load_and_process_file(f, tolerate=tolerate)
             if (i+1) % 10 == 0:
                 print(f"Processed {i+1}/{len(file_list)} files...")
 

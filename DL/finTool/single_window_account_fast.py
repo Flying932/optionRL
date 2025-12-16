@@ -671,6 +671,7 @@ class single_Account:
             df.to_excel(filepath, sheet_name='交易记录', index=False)
         
     def get_step_length(self, code: str, start_time: str, end_time: str):
+
         df = self.real_info_controller.get_bars_between(code, start_time, end_time)
         return len(df)
 
@@ -802,7 +803,46 @@ class single_Account:
         self.h_states.append(single)
         return current_state, self.get_history_state()
 
+
+    
     def getReward(self, action: int, eps: float=1e-6):
+            # 1. 基础收益 (Log Return)
+            if len(self.equity_list) <= 1:
+                step_ret = 0.0
+            else:
+                prev, cur = self.equity_list[-2], self.equity_list[-1]
+                step_ret = np.log((cur + eps) / (prev + eps))
+            
+            # 放大收益信号
+            final_reward = step_ret * 200.0  # 稍微放大一点，让梯度更明显
+
+            base = final_reward
+
+            # 2. 回撤惩罚 (改为：只惩罚回撤扩大的部分，或者惩罚波动率)
+            # 原始的 -10 * dd 是持续惩罚，太重了。
+            # 方案 A: 差分回撤 (如果回撤扩大了才罚)
+            # peak = self.equity_peak
+            # cur_dd = (peak - self.equity) / peak
+            # prev_dd = (peak - prev) / peak # 注意这里 peak 可能是变化的，稍微复杂
+            
+            # 方案 B (推荐): 简单的波动率惩罚 (Risk Adjusted)
+            # 如果收益是负的，给予额外惩罚
+            if step_ret < 0:
+                final_reward *= 1.5 # 亏钱时痛感加倍
+
+            # 3. 破产/大回撤 终止惩罚 (这是稀疏信号，给重一点没事)
+            if self.equity < self.init_capital * 0.6:
+                final_reward -= 100.0 # 暴击
+            
+            # 4. 鼓励持仓 (可选，防止学成一直空仓)
+            if action == 0 and self.has_positions():
+               final_reward += 0.001 
+            
+            print(f"base = {base}, final = {final_reward}")
+
+            return float(final_reward)
+
+    def old_getReward(self, action: int, eps: float=1e-6):
         if len(self.equity_list) <= 1:
             step_ret = 0.0
         else:
@@ -865,6 +905,7 @@ if __name__ == '__main__':
     account.set_combos(call, put)
     target = '510050'
 
+
     # dtype = {
     #     'call': str,
     #     'put': str,
@@ -877,31 +918,38 @@ if __name__ == '__main__':
     #     'ignore_days': int,
     #     'steps': int,
     # }
+    
 
     # def calculate_score(row):
     #     """自定义计算逻辑，输入是一行数据"""
     #     start = row['call_open']
     #     end = row['call_expire']
 
+
     #     start_time = datetime.strptime(start, "%Y%m%d")
     #     end_time = datetime.strptime(end, "%Y%m%d")
     #     days = (end_time - start_time).days
 
+    #     call = row['call']
+    
     #     if days <= 40:
     #         return 0
 
-    #     end_time = start_time + timedelta(days=20)
+    #     end_time = end_time - timedelta(days=20)
     #     end_time = end_time.strftime('%Y%m%d')
 
     #     start_time = start + '100000'
     #     end_time = end_time + '150000'
-    #     call = row['call']
+        
     #     return account.get_step_length(call, start_time, end_time)
 
     # df = pd.read_excel('./miniQMT/datasets/all_label_data/20251213_train.xlsx', dtype=dtype)
     # df['steps'] = df.apply(calculate_score, axis=1)
     # df['ignore_days'] = df.apply(lambda row: 20, axis=1)
-    # df.to_excel('./miniQMT/datasets/all_label_data/20251213_train.xlsx', dtype=dtype)
+    # df['Call_strike'] = df.apply(lambda row: account.option_info_controller.get_strikePrice(row['call']), axis=1)
+    # df['Put_strike'] = df.apply(lambda row: account.option_info_controller.get_strikePrice(row['put']), axis=1)
+
+    # df.to_excel('./miniQMT/datasets/all_label_data/20251213_train.xlsx', index=False)
     # print(0 / 0)
 
     # 取样本数据(你的 RealInfo 里方法名可能是 get_bars_between 或 get_bars_between_from_df)

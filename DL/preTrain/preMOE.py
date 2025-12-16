@@ -719,7 +719,7 @@ def main(lookback: int=32, pre_len: int=4, batch_size: int=256, num_workers: int
 
     from preTrainDataGen import OptionTrainingDataGenerator
     generator = OptionTrainingDataGenerator(window_size=LOOKBACK, predict_horizon=HORIZON, min_ratio=MIN_RATIO)
-    train_loader, valid_loader, test_loader = generator.get_data_loader(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
+    train_loader, valid_loader, test_loader = generator.get_data_loader(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS, tolerate=4)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 

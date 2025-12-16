@@ -21,6 +21,7 @@ from preTrain.preMOE import PreMOE
 from dataclasses import dataclass
 import random
 import multiprocessing as mp
+import traceback
 
 # —— 构造每个样本的权重掩码 —— #
 A_HOLD, A_LONG, A_SHORT, A_CLOSE = 0, 1, 2, 3
@@ -89,7 +90,323 @@ class CloudpickleWrapper(object):
         import pickle
         self.x = pickle.loads(ob)
 
-def worker(remote, parent_remote, env_fn_wrapper):
+def worker(remote, parent_remote, env_fn_wrapper, worker_cfg: Dict[str, Any]):
+    parent_remote.close()
+    try:
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
+
+    try:
+        env = env_fn_wrapper.x()
+    except Exception:
+        tb = traceback.format_exc()
+        remote.send(("__init_error__", tb))
+        remote.close()
+        return
+
+    # build extractor (CPU)
+    try:
+        extractor = PreMOE(
+            seq_len=worker_cfg["window_size"],
+            pred_len=worker_cfg["pre_len"],
+            n_variates=worker_cfg["n_variates"],
+            d_router=worker_cfg["d_router"],
+        ).to("cpu")
+        if worker_cfg.get("pretrained_path") and os.path.exists(worker_cfg["pretrained_path"]):
+            sd = torch.load(worker_cfg["pretrained_path"], map_location="cpu")
+            extractor.load_state_dict(sd, strict=True)
+        extractor.eval()
+        for p in extractor.parameters():
+            p.requires_grad = False
+    except Exception:
+        tb = traceback.format_exc()
+        remote.send(("__init_error__", tb))
+        remote.close()
+        return
+
+    feat = FeaturePipeline(extractor, device="cpu", adapter_dim=worker_cfg["adapter_dim"])
+    actor: Optional[ActorDualHead] = None
+    critic: Optional[ValueNet] = None
+
+    pending_payload: Optional[Dict[str, Any]] = None
+    adapter_dims: Optional[Dict[str, int]] = None
+
+    def ensure_policy(curr_np: np.ndarray, hist_np: np.ndarray):
+        nonlocal actor, critic, pending_payload, adapter_dims
+        curr = torch.from_numpy(curr_np).float().unsqueeze(0)
+        hist = torch.from_numpy(hist_np).float().unsqueeze(0)
+        s, dims = feat.obs_to_state_normed(curr, hist, update_norm=False)
+        adapter_dims = dims
+        state_dim = int(s.shape[-1])
+        if actor is None:
+            actor = ActorDualHead(state_dim, hidden_dim=worker_cfg["hidden_dim"]).to("cpu")
+            critic = ValueNet(state_dim, hidden_dim=worker_cfg["hidden_dim"]).to("cpu")
+        if pending_payload is not None:
+            apply_payload(pending_payload)
+            pending_payload = None
+
+    def apply_payload(payload: Dict[str, Any]):
+        nonlocal actor, critic, adapter_dims
+        if adapter_dims is None and payload.get("adapter_dims") is not None:
+            adapter_dims = payload["adapter_dims"]
+
+        if adapter_dims is not None:
+            feat.build_adapter_from_dims(adapter_dims)
+
+        if payload.get("norm_state") is not None:
+            feat.build_norm_if_needed(int(payload["norm_state"]["mean"].numel()))
+            assert feat.norm is not None
+            feat.norm.load_state_dict(payload["norm_state"], device="cpu")
+
+        if payload.get("adapter_state") is not None:
+            assert feat.adapter is not None
+            feat.adapter.load_state_dict(payload["adapter_state"], strict=True)
+
+        if actor is not None and payload.get("actor_state") is not None:
+            actor.load_state_dict(payload["actor_state"], strict=True)
+        if critic is not None and payload.get("critic_state") is not None:
+            critic.load_state_dict(payload["critic_state"], strict=True)
+
+    def sample_action_weight(state_1d: torch.Tensor) -> Tuple[int, int, float, float, float]:
+        """
+        注意：这个函数本身不包 no_grad，但它只会在 rollout 循环的 with torch.no_grad() 内被调用
+        所以不会产生梯度图，也不会占 GPU/CPU 的反传开销。
+        """
+        assert actor is not None and critic is not None
+        logits_a, logits_w = actor(state_1d)
+        logits_a = logits_a.squeeze(0)
+        logits_w = logits_w.squeeze(0)
+
+        dist_a = Categorical(logits=logits_a)
+        a = int(dist_a.sample().item())
+        logp_a = float(dist_a.log_prob(torch.tensor(a)).item())
+
+        allowed = torch.zeros(5, dtype=torch.bool)
+        if a in (A_LONG, A_SHORT, A_CLOSE):
+            allowed[1:] = True
+            need_w = 1.0
+        else:
+            allowed[0] = True
+            need_w = 0.0
+
+        masked = logits_w.clone()
+        masked[~allowed] = -1e9
+        dist_w = Categorical(logits=masked)
+        wi = int(dist_w.sample().item())
+        logp_w = float(dist_w.log_prob(torch.tensor(wi)).item())
+
+        wv = float(WEIGHT_BINS[wi])
+        logp_joint = logp_a + need_w * logp_w
+        v = float(critic(state_1d).squeeze(-1).item())
+        return a, wi, wv, logp_joint, v
+
+    # 用于 rewardScaling 的 gamma
+    gamma = float(worker_cfg.get("gamma", 0.99))
+
+    while True:
+        try:
+            cmd, data = remote.recv()
+        except EOFError:
+            break
+
+        try:
+            if cmd == "__ping__":
+                remote.send(("__pong__", None))
+
+            elif cmd == "set_task":
+                idx = int(data)
+                if hasattr(env, "set_task"):
+                    env.set_task(idx)
+                remote.send(("ok", None))
+
+            elif cmd == "set_weights":
+                payload = data
+                if actor is None or critic is None or feat.adapter is None or feat.norm is None:
+                    pending_payload = payload
+                else:
+                    apply_payload(payload)
+                remote.send(("ok", None))
+
+            elif cmd == "rollout":
+                T = int(data["T"])
+
+                # ---- reset env ----
+                reset_out = env.reset()
+                if isinstance(reset_out, (tuple, list)) and len(reset_out) >= 2:
+                    curr_np, hist_np = reset_out[0], reset_out[1]
+                else:
+                    raise RuntimeError(f"env.reset unexpected: {type(reset_out)}")
+
+                curr_np = np.asarray(curr_np, np.float32)
+                hist_np = np.asarray(hist_np, np.float32)
+
+                ensure_policy(curr_np, hist_np)
+
+                Dc = int(curr_np.shape[-1])
+                L = int(hist_np.shape[-2])
+                Dh = int(hist_np.shape[-1])
+
+                # ---- buffers ----
+                raw_curr = np.zeros((T, Dc), np.float32)
+                raw_hist = np.zeros((T, L, Dh), np.float32)
+                actions = np.zeros((T,), np.int64)
+                w_idx = np.zeros((T,), np.int64)
+                w_val = np.zeros((T,), np.float32)
+                logp_old = np.zeros((T,), np.float32)
+                value_old = np.zeros((T,), np.float32)
+
+                # rewards 对齐：rewards[t] 应该是 “t 动作”的奖励
+                # 但 env.step 在 t 返回的是 (t-1) 动作的奖励，所以我们写 rewards[t-1] = r_scaled
+                rewards = np.zeros((T,), np.float32)
+
+                done = np.zeros((T,), np.bool_)    # done[t] 对应 “t 动作之后是否终止”
+                valid = np.zeros((T,), np.bool_)   # valid[t] 表示这一步 transition 是否可用于训练（必须有对齐后的 reward）
+
+                # ---- per-episode RewardScaling (每个 worker/episode 独立) ----
+                r_scaler = RewardScaling(shape=1, gamma=gamma)
+                try:
+                    r_scaler.reset()
+                except Exception:
+                    pass
+
+                terminated_early = False
+
+                # 你这个环境的 reward 延迟：t 返回 R_t，但属于 t-1 动作
+                # 因此：t=0 的 reward 无意义；最后一个动作没有 reward（除非你额外再 step 一次）
+                for t in range(T):
+                    # 1) record state at time t
+                    raw_curr[t] = curr_np
+                    raw_hist[t] = hist_np
+
+                    if terminated_early:
+                        # padding
+                        actions[t] = A_HOLD
+                        w_idx[t] = 0
+                        w_val[t] = 0.0
+                        logp_old[t] = 0.0
+                        value_old[t] = 0.0
+                        rewards[t] = 0.0
+                        done[t] = True
+                        valid[t] = False
+                        continue
+
+                    # 2) decide action using policy (NO GRAD)
+                    with torch.no_grad():
+                        curr = torch.from_numpy(curr_np).unsqueeze(0)
+                        hist = torch.from_numpy(hist_np).unsqueeze(0)
+                        s, _ = feat.obs_to_state_normed(curr, hist, update_norm=False)
+                        a, wi, wv, lp, v = sample_action_weight(s)
+
+                    # 3) env step
+                    step_out = env.step(a, wv)
+                    if isinstance(step_out, (tuple, list)) and len(step_out) >= 5:
+                        next_curr, next_hist, r, term, trunc = step_out[0], step_out[1], step_out[2], step_out[3], step_out[4]
+                    else:
+                        raise RuntimeError(f"env.step return length={len(step_out)} unexpected")
+
+                    d = bool(term or trunc)
+
+                    # 4) write transition fields for time t (but reward for t will come at t+1)
+                    actions[t] = a
+                    w_idx[t] = wi
+                    w_val[t] = wv
+                    logp_old[t] = lp
+                    value_old[t] = v
+                    done[t] = d
+
+                    # 5) reward alignment + rewardScaling:
+                    # 当前 step 返回的 r 属于 (t-1) 的动作，所以写入 rewards[t-1]
+                    # 并且 t=0 的 r 丢弃
+                    try:
+                        r_in = torch.as_tensor([float(r)], dtype=torch.float32)
+                        r_scaled = float(r_scaler(r_in).item())
+                    except Exception:
+                        # 兜底：如果 RewardScaling 支持 float 输入
+                        r_scaled = float(r_scaler(float(r)))
+
+                    if t > 0:
+                        # 只有 (t-1) 这个 transition 才真正拿到了属于它的 reward，所以才 valid
+                        rewards[t - 1] = r_scaled
+                        # 注意：t-1 这步是否有效，还得看 t-1 自己是否是“最后一步”/是否被提前终止
+                        # 这里只保证 reward 已对齐到 t-1
+                        valid[t - 1] = True
+
+                    # 当前 t 这步：reward 还没来，所以先不置 valid[t]
+                    # 如果这一刻终止了，那么这一步永远等不到 reward -> valid[t] 必须 False
+                    if d:
+                        terminated_early = True
+                        valid[t] = False  # 强制
+                        # 终止时不再更新 curr_np/hist_np
+                        continue
+
+                    # 6) move to next state
+                    curr_np = np.asarray(next_curr, np.float32)
+                    hist_np = np.asarray(next_hist, np.float32)
+
+                # ---- 关键：最后一步永远没有下一步 reward（延迟机制下），必须 mask 掉 ----
+                valid[T - 1] = False
+                rewards[T - 1] = 0.0
+
+                # ---- bootstrap last_value（保留你原逻辑） ----
+                if not terminated_early:
+                    with torch.no_grad():
+                        curr = torch.from_numpy(curr_np).unsqueeze(0)
+                        hist = torch.from_numpy(hist_np).unsqueeze(0)
+                        s_last, _ = feat.obs_to_state_normed(curr, hist, update_norm=False)
+                        assert critic is not None
+                        last_value = float(critic(s_last).squeeze(-1).item())
+                else:
+                    last_value = 0.0
+
+                # equity_end：尽量从 env.account_controller 取
+                equity_end = None
+                try:
+                    if hasattr(env, "account_controller") and hasattr(env.account_controller, "equity"):
+                        equity_end = float(env.account_controller.equity)
+                except Exception:
+                    equity_end = None
+                if equity_end is None:
+                    equity_end = float("nan")
+
+                remote.send(("traj", {
+                    "raw_curr": raw_curr,
+                    "raw_hist": raw_hist,
+                    "actions": actions,
+                    "w_idx": w_idx,
+                    "w_val": w_val,
+                    "logp_old": logp_old,
+                    "value_old": value_old,
+                    "rewards": rewards,
+                    "done": done,
+                    "valid": valid,
+                    "last_value": np.array([last_value], np.float32),
+                    "equity_end": np.array([equity_end], np.float32),
+                }))
+
+            elif cmd == "close":
+                try:
+                    env.close()
+                except Exception:
+                    pass
+                remote.send(("ok", None))
+                remote.close()
+                break
+
+            else:
+                raise NotImplementedError(cmd)
+
+        except Exception:
+            tb = traceback.format_exc()
+            try:
+                remote.send(("error", tb))
+            except Exception:
+                pass
+            break
+
+
+def old_worker(remote, parent_remote, env_fn_wrapper):
     parent_remote.close()
     env = env_fn_wrapper.x()
     try:

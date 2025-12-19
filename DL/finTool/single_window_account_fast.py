@@ -16,13 +16,54 @@ from collections import deque
 import warnings
 from datetime import timedelta, datetime
 
-# 引入包 (根据你的文件结构保持不变)
-if __name__ != '__main__':
-    from finTool.optionBaseInfo import optionBaseInfo
-    from finTool.realInfo import RealInfo
-else:
-    from optionBaseInfo import optionBaseInfo
-    from realInfo import RealInfo
+import sys
+from pathlib import Path
+
+def setup_miniqmt_import_root():
+    """
+    递归查找 'miniQMT' 文件夹，并将其添加到 sys.path 中，
+    从而允许使用 miniQMT 为根的绝对导入。
+    """
+    
+    # 1. 获取当前脚本的绝对路径
+    # stack[0] 是当前正在执行的帧，其 f_globals['__file__'] 是脚本路径
+    try:
+        # 获取调用此函数的脚本的路径
+        calling_script_path = Path(sys._getframe(1).f_globals['__file__']).resolve()
+    except KeyError:
+        # 如果在交互式环境或某些特殊环境中，可能无法获取文件路径，则退出
+        print("⚠️ 警告: 无法确定当前脚本路径，跳过路径设置。")
+        return
+    
+    current_path = calling_script_path
+    miniqmt_root = None
+    
+    # 2. 向上递归查找
+    # current_path.parents 是一个包含所有父目录的序列
+    for parent in [current_path] + list(current_path.parents):
+        if parent.name == 'miniQMT':
+            miniqmt_root = parent
+            break
+        
+    # 3. 检查并添加路径
+    if miniqmt_root:
+        # 将找到的 miniQMT 目录添加到 sys.path
+        miniqmt_root_str = str(miniqmt_root)
+        if miniqmt_root_str not in sys.path:
+            sys.path.insert(0, miniqmt_root_str)
+            print(f"✅ 成功将项目根目录添加到搜索路径: {miniqmt_root_str}")
+        else:
+            # 已经添加过，无需重复添加
+            # print(f"ℹ️ 项目根目录已在搜索路径中: {miniqmt_root_str}")
+            pass
+    else:
+        print("❌ 错误: 未能在当前路径或其任何父目录中找到 'miniQMT' 文件夹。")
+
+setup_miniqmt_import_root()
+
+from DL.finTool.optionBaseInfo import optionBaseInfo
+from DL.finTool.realInfo import RealInfo
+
 
 # ========================== 数据结构 ==========================
 @dataclass(slots=True)
@@ -116,12 +157,18 @@ class single_Account:
         self.volume_cache = {}
         self.margin_cache = {}
         self.greek_cache = {} 
+        self.open_cache = {}  # 【新增】存 Open
+        self.raw_returns = []  # 记录真实的单步收益率（不带任何 penalty）
+
+        # 新加的信息
+        self.last_action = 0
+
 
     def set_combos(self, call: str, put: str):
         self.comb['call'] = call
         self.comb['put'] = put
 
-    def init_hv160(self, start_time: str, end_time: str, targetCode: str):
+    def init_hv160(self, start_time: str, end_time: str, targetCode: str='510050'):
         """计算历史波动率 (作为 IV 反推失败时的兜底)"""
         try:
             before_str = self.real_info_controller.get_prev_30_days(start_time[0: 8], days=100)
@@ -251,9 +298,9 @@ class single_Account:
         
         # 1. 加载标的数据
         try:
-            df_target = self.real_info_controller.get_bars_between(target_code, start_time, end_time, self.period, columns=('ts', 'close', 'volume'))
+            df_target = self.real_info_controller.get_bars_between(target_code, start_time, end_time, self.period, columns=('ts', 'close', 'volume', 'open'))
         except:
-            df_target = self.real_info_controller.get_bars_between_from_df(target_code, start_time, end_time, self.period, columns=('ts', 'close', 'volume'))
+            df_target = self.real_info_controller.get_bars_between_from_df(target_code, start_time, end_time, self.period, columns=('ts', 'close', 'volume', 'open'))
         
         # 构造标的价格数组 (按时间对齐)
         target_map = {str(r.ts).replace(' ', '').replace('-', '').replace(':', ''): float(r.close) for r in df_target.itertuples()}
@@ -263,9 +310,9 @@ class single_Account:
             if code in self.price_cache: continue
 
             try:
-                df = self.real_info_controller.get_bars_between(code, start_time, end_time, self.period, columns=('ts', 'close', 'volume'))
+                df = self.real_info_controller.get_bars_between(code, start_time, end_time, self.period, columns=('ts', 'close', 'volume', 'open'))
             except:
-                df = self.real_info_controller.get_bars_between_from_df(code, start_time, end_time, self.period, columns=('ts', 'close', 'volume'))
+                df = self.real_info_controller.get_bars_between_from_df(code, start_time, end_time, self.period, columns=('ts', 'close', 'volume', 'open'))
             
             # 准备向量化计算的数组
             ts_list = []
@@ -282,14 +329,17 @@ class single_Account:
             
             p_cache = {}
             v_cache = {}
+            o_cache = {} # Open Cache 【新增】
             
             for row in df.itertuples():
                 ts_str = str(row.ts).replace(' ', '').replace('-', '').replace(':', '')
                 close_p = float(row.close)
                 vol = int(row.volume)
+                open_p = float(row.open) # 【新增】
                 
                 p_cache[ts_str] = close_p
                 v_cache[ts_str] = vol
+                o_cache[ts_str] = open_p # 【新增】
                 
                 # 对齐标的价格
                 s_val = target_map.get(ts_str)
@@ -303,6 +353,7 @@ class single_Account:
 
             self.price_cache[code] = p_cache
             self.volume_cache[code] = v_cache
+            self.open_cache[code] = o_cache # 【新增】
             self.margin_cache[code] = float(self.option_info_controller.get_margin(code))
             
             # 🔥 批量计算 Greeks (如果有数据)
@@ -338,6 +389,12 @@ class single_Account:
         if code in self.price_cache:
             return self.price_cache[code].get(time_str, 0.0)
         return float(self.real_info_controller.get_close_by_str(code, time_str))
+
+    def getOpenPrice(self, code: str, time_str: str) -> float:
+            """优先从缓存取 Open, 没有则读文件"""
+            if code in self.open_cache:
+                return self.open_cache[code].get(time_str, 0.0)
+            return float(self.real_info_controller.get_open_by_str(code, time_str))
 
     def getRealVolume(self, code: str, time_str: str) -> int:
         if code in self.volume_cache:
@@ -589,9 +646,163 @@ class single_Account:
         self.frozen_money_list.append(self.frozen_money)
         self.free_money_list.append(self.free_money)
 
-    def simulate_fill(self, time_str: str):
-        # 处理成交，扣除手续费，变动现金
-        if self.has_disposed_id >= len(self.Orders) - 1: return
+    def simulate_fill_moc(self, time_str: str):
+        """
+        MOC 专用撮合函数 (修正版)
+        1. 以当前收盘价 + 随机滑点 进行撮合。
+        2. 【修复】平仓时严格遵循下单数量 (volume)，不再强制全平。
+        """
+        # 如果没有新订单，直接返回
+        if self.has_disposed_id >= len(self.Orders) - 1: 
+            return
+        
+        # 遍历所有未处理的订单
+        for order in self.Orders[self.has_disposed_id + 1:]:
+            self.has_disposed_id += 1 # 标记为已处理
+            
+            code = order.code
+            direction = order.direction
+            volume = int(order.init_volume) # 这是下单时指定的数量 (受 w 影响)
+            order_id = order.order_id
+            
+            # 跳过强制平仓单
+            if '强制' in (order.info or ''): continue
+
+            # 期权到期检查
+            if len(code) == 8:
+                expire = self.option_info_controller.get_expireDate(code)
+                if expire < time_str[0:8]:
+                    order.status = '废单'
+                    order.info = '期权到期后无法下单'
+                    continue
+
+            # 获取真实成交量限制
+            real_volume = self.getRealVolume(code, time_str)
+            
+            # 1. 获取基础收盘价
+            raw_close = self.getClosePrice(code, time_str)
+            
+            # 2. 计算滑点
+            slippage_rate = abs(np.random.normal(0, 0.0005)) 
+            
+            if '买' in direction:
+                 price = raw_close * (1 + slippage_rate)
+            else:
+                 price = raw_close * (1 - slippage_rate)
+
+            # 3. 资金与持仓处理
+            mul = self.option_info_controller.get_multiplier(code)
+            margin = self.getMargin(code) if len(code) == 8 else 0.0
+            free_sub = self.free_money
+
+            if len(code) == 8:
+                if direction == '买入开仓':
+                    cost_per_unit = mul * price + self.fee
+                    num_can_buy = int(free_sub // cost_per_unit) if cost_per_unit > 0 else 0
+                    max_cnt = max(0, min(volume, num_can_buy, real_volume))
+                    
+                    if max_cnt <= 0:
+                        order.status = '废单'
+                        order.info = '组合资金不足开仓'
+                        continue
+                        
+                    order.success_volume = max_cnt
+                    order.status = '成交' if max_cnt == volume else '部分成交'
+                    
+                    frozen_delta = 0.0
+                    free_delta = -price * max_cnt * mul - max_cnt * self.fee
+                    
+                    self.dispose_order(code, +max_cnt, price, free_delta, frozen_delta)
+                    trade = Trade(order_id, code, direction, price * max_cnt * mul, self.fee * max_cnt, time_str, max_cnt)
+                    self.Trades.append(trade)
+
+                elif direction == '卖出开仓':
+                    num_can_sell_open = int(free_sub // margin) if margin > 0 else 0
+                    max_cnt = max(0, min(volume, num_can_sell_open, real_volume))
+                    
+                    if max_cnt <= 0:
+                        order.status = '废单'
+                        order.info = '组合资金不足开仓'
+                        continue
+                        
+                    order.success_volume = max_cnt
+                    order.status = '成交' if max_cnt == volume else '部分成交'
+                    
+                    frozen_delta = margin * max_cnt
+                    free_delta = price * mul * max_cnt - margin * max_cnt
+                    
+                    self.dispose_order(code, -max_cnt, price, free_delta, frozen_delta)
+                    trade = Trade(order_id, code, direction, price * max_cnt * mul, 0.0, time_str, max_cnt)
+                    self.Trades.append(trade)
+
+                elif direction == '买入平仓':
+                    raw = self.positions.get(code, ('无仓位', 0, 0.0))
+                    raw_dir, raw_vol = raw[0], raw[1]
+                    
+                    # 检查持仓是否足够
+                    if raw_vol == 0 or raw_dir != '卖出开仓':
+                        order.status = '废单'
+                        continue
+                        
+                    # 【修复】这里必须取 min(下单量, 现有持仓量)
+                    # 之前错误的写成了 max_cnt = raw_vol，导致 w 失效
+                    max_cnt = min(volume, raw_vol)
+                    
+                    if max_cnt <= 0:
+                         order.status = '废单'
+                         continue
+
+                    fee = self.fee * max_cnt
+                    
+                    frozen_delta = -margin * max_cnt # 释放保证金
+                    free_delta = margin * max_cnt - fee - price * max_cnt * mul 
+                    
+                    order.success_volume = max_cnt
+                    order.status = '成交'
+                    
+                    self.dispose_order(code, +max_cnt, price, free_delta, frozen_delta)
+                    trade = Trade(order_id, code, direction, price * max_cnt * mul, fee, time_str, max_cnt)
+                    self.Trades.append(trade)
+
+                elif direction == '卖出平仓':
+                    raw = self.positions.get(code, ('无仓位', 0, 0.0))
+                    raw_dir, raw_vol = raw[0], raw[1]
+                    
+                    if raw_vol == 0 or raw_dir != '买入开仓':
+                        order.status = '废单'
+                        continue
+                    
+                    # 【修复】同上，遵循下单量
+                    max_cnt = min(volume, raw_vol)
+                    
+                    if max_cnt <= 0:
+                         order.status = '废单'
+                         continue
+                    
+                    frozen_delta = 0.0
+                    free_delta = price * max_cnt * mul 
+                    
+                    order.success_volume = max_cnt
+                    order.status = '成交'
+                    
+                    self.dispose_order(code, -max_cnt, price, free_delta, frozen_delta)
+                    trade = Trade(order_id, code, direction, price * max_cnt * mul, 0.0, time_str, max_cnt)
+                    self.Trades.append(trade)
+            else:
+                order.status = '废单'
+                order.info = '目前暂不交易股票'
+
+
+    def simulate_fill(self, time_str: str, use_open_price: bool = True):
+        """
+        Args:
+            time_str: 当前时间
+            use_open_price: 如果为 True,强制使用 Open 价格进行撮合 (Next Open 模式)
+                            如果为 False,使用 Close 价格 (MOC 模式)
+        """
+        if self.has_disposed_id >= len(self.Orders) - 1: 
+            return
+        
         for order in self.Orders[self.has_disposed_id + 1:]:
             self.has_disposed_id += 1
             code = order.code
@@ -609,7 +820,14 @@ class single_Account:
                     continue
 
             real_volume = self.getRealVolume(code, time_str)
-            price = self.getClosePrice(code, time_str)
+    
+
+            # 【核心修改】：根据参数决定用 Open 还是 Close
+            if use_open_price:
+                price = self.getOpenPrice(code, time_str)
+            else:
+                price = self.getClosePrice(code, time_str)
+
             mul = self.option_info_controller.get_multiplier(code)
             margin = self.getMargin(code) if len(code) == 8 else 0.0
             free_sub = self.free_money
@@ -713,62 +931,81 @@ class single_Account:
         return len(df)
 
     # ================= 强化学习接口 =================
-
     def step(self, action, weight, ts, close):
-        # 1. 【关键】记录 Step 开始时的净值
-        # 注意：这里取的是上一步结束时的净值
-        step_start_equity = self.equity
+        """
+        【Next-Open 模式 + 原版 getReward】
+        逻辑链条：
+        1. 开盘：执行 T-1 的 Action，扣除手续费。
+        2. 收盘：观察 T 的行情。
+        3. 结算：计算 T-1 到 T 的总盈亏 (含 a_{t-1} 成本) 给 getReward。
+        4. 决策：提交 T 的 Action，留待 T+1 执行。
+        """
+        # 1. 记录 T-1 结束时的净值 (来自上一步的 equity_list 最后一位)
+        prev_equity = self.equity_list[-1] if self.equity_list else self.init_capital
 
-        # 2. 更新环境基础数据 (价格变动 -> 净值变动)
-        # init_state 内部会调用 _update_comb_equity，更新因价格波动导致的市值变化
-        self.init_state(ts, close)
+        # 2. 执行 T-1 提交的 Pending Orders (以当前 T 的 Open 价成交)
+        # 这步执行完后，账户的 free_money, positions 会更新
+        self.simulate_fill(ts, use_open_price=True) 
         
-        # 3. 模拟撮合 (处理上一时刻的挂单 -> 现金/持仓变动 -> 净值变动)
-        # 内部会调用 _update_comb_equity
-        self.simulate_fill(ts)
-        
-        # 4. 执行 Action (挂新单 -> 此时净值通常不变，除非有立即成交逻辑，目前代码是挂单制)
-        c_id = -1
-        call, put = self.comb['call'], self.comb['put']
-        
-        if action == 1: # Long
-            target_vol = 10 
-            self.open_long_pair(target_vol, ts, call, put, c_id)
-        elif action == 2: # Short
-            target_vol = 10
-            self.open_short_pair(target_vol, ts, call, put, c_id)
-        elif action == 3: # Close
-            self.close_pair(ts, call, put, w=weight, c_id=c_id)
-        
-        # 5. 更新持仓与净值 (处理到期/行权 -> 净值变动)
-        # 内部会调用 _update_comb_equity
+        # 3. 更新持仓市值与账户净值 (基于当前 T 的收盘价 Close)
+        # 这里刷新了 self.equity, self.equity_peak, self.cash_ratio 等
         self.update_positions(ts)
-
-        # 5.1【新增】在这里统一结算本 Step 的最终权益
-        self._update_comb_equity()
+        self.init_state(ts, close) # 刷新 Greeks 和价格观察
+        self._update_comb_equity() 
         
-        # 6. 【关键修复】计算本 Step 的总收益率 (Target Gain)
-        # 此时 self.equity 是本步结束时的最终净值
-        denom = step_start_equity if abs(step_start_equity) > 1e-6 else 1.0
-        self.target_gain = (self.equity - step_start_equity) / denom
-        
-        # 7. 记录数据
+        # 4. 计算本步总收益 (供夏普和日志使用)
+        # 注意：这里的收益包含了 (T-1到T的价格波动) + (a_{t-1}产生的摩擦成本)
+        self.target_gain = (self.equity - prev_equity) / (prev_equity + 1e-8)
+        self.raw_returns.append(self.target_gain)
         self.equity_list.append(self.equity) 
         self.time_list.append(ts)
-        self.target_gain_list.append(self.target_gain) # 方便后续画图
 
-        # 8. 返回状态和奖励
-        # 注意：get_total_state 内部会用到刚刚计算好的 self.target_gain
+        # 5. 调用你提供的原版 getReward
+        # 此时 equity_list 已更新，prev 是上一步，cur 是当前步，逻辑完美对齐
+        reward = self.getReward(self.last_action)
+        self.last_action = action
+
+        # 6. 获取状态 (作为下一回合决策的输入)
         curr, hist = self.get_total_state()
-        reward = self.getReward(action)
-        truncated = self.if_truncated()
-        
-        return curr, hist, reward, truncated
 
+        # 7. 提交本回合动作 a_T (Pending，下个 Step 才会成交)
+        call, put = self.comb['call'], self.comb['put']
+        
+        # 结合 Weight 动态计算下单量 (购买力约束 90%)
+        max_margin_allow = self.free_money * 0.9
+        margin_per_pair = self.getMargin(call) + self.getMargin(put)
+        cap_vol = int(max_margin_allow / (margin_per_pair + 1e-6))
+        target_vol = int(min(cap_vol, 50) * weight) 
+        if weight > 0 and target_vol < 1: target_vol = 1
+
+        if action == 1: self.open_long_pair(target_vol, ts, call, put)
+        elif action == 2: self.open_short_pair(target_vol, ts, call, put)
+        elif action == 3: self.close_pair(ts, call, put, w=weight)
+
+        return curr, hist, reward, self.if_truncated()
+
+
+    # 增加计算夏普的方法：
+    def get_sharpe_ratio(self):
+        """
+        计算当前 Episode 的年化夏普比率
+        年化因子 = sqrt(252天 * 每天8根30分钟K线) = sqrt(2016)
+        """
+        if len(self.raw_returns) < 2:
+            return 0.0
+        
+        returns_arr = np.array(self.raw_returns)
+        mean_ret = np.mean(returns_arr)
+        std_ret = np.std(returns_arr) + 1e-9 # 防止除零
+        
+        # 30分钟K线的年化因子
+        annual_factor = np.sqrt(252 * 8) 
+        sharpe = annual_factor * (mean_ret / std_ret)
+        return float(sharpe)
 
 
     def init_state(self, time_str: str, close: float):
-        """仅查表，不计算，极速"""
+        """仅查表，不计算，极速更新当前时刻的市场状态"""
         self.target_price = float(close)
         call, put = self.comb['call'], self.comb['put']
         
@@ -790,6 +1027,16 @@ class single_Account:
         self.comb['call_iv']    = c_greeks.get('iv', 0.0)
         self.comb['put_iv']     = p_greeks.get('iv', 0.0)
         
+        # 【新增】更新 rho (之前的代码漏了 rho，但你的状态里需要)
+        self.comb['call_rho']   = c_greeks.get('rho', 0.0)
+        self.comb['put_rho']    = p_greeks.get('rho', 0.0)
+
+        # 【新增】更新 HV160 (历史波动率)
+        # 假设 HV 是基于标的(510050)的，所以 Call/Put 共用同一个 HV
+        hv_val = self.get_hv_160(time_str)
+        self.comb['call_hv_160'] = hv_val
+        self.comb['put_hv_160']  = hv_val
+        
         self.comb['call_price'] = self.getClosePrice(call, time_str)
         self.comb['put_price'] = self.getClosePrice(put, time_str)
         
@@ -798,8 +1045,17 @@ class single_Account:
         self.comb['put_real_value'] = max(0, self.comb['put_strike'] - close)
         self.comb['put_time_value'] = self.comb['put_price'] - self.comb['put_real_value']
         
-        self._update_position_values(time_str)
-        self._update_comb_equity()
+        # 计算 TTM (虽然 get_total_state 里有判空逻辑，这里更新一下更稳)
+        # 注意：这里需要 RealInfo 支持，或者直接从 Greek Cache 反推 TTM (如果有存)
+        # 简单起见，如果 cache 里没存 ttm，这里可以用 self.real_info_controller 计算
+        # self.comb['call_ttm'] = ... (由于 calculate_score 或其他地方可能算过了，这里暂且不强更，或者在 preload 里加 ttm)
+        # 为防止 0，建议在 preload_data 的 greek_cache 构造时把 ttm 也存进去，或者这里实时算：
+        expire = self.option_info_controller.get_expireDate(call)
+        self.comb['call_ttm'] = self.real_info_controller.get_ttm(time_str, expire)
+        self.comb['put_ttm']  = self.comb['call_ttm']
+
+        # self._update_position_values(time_str)
+        # self._update_comb_equity()
 
     def get_history_state(self):
         # 修复 NoneType 错误
@@ -812,6 +1068,11 @@ class single_Account:
         return hist
 
     def get_total_state(self):
+        """
+        严格匹配神经网络输入维度的状态获取函数。
+        Scalar Dim = 9
+        Seq Feature Dim = 26
+        """
         current_state = []
         gs = {
             'cash_ratio': self.cash_ratio if abs(self.cash_ratio) > self.eps else 0,
@@ -829,13 +1090,16 @@ class single_Account:
         current_state.append(self.frozen_money / self.init_capital)
         current_state.append(self.equity / self.init_capital)
 
+        # 确保分母不为0，虽然 +1e-6 已经处理了
         close = self.target_price + 1e-6
+        
         single = [
+            # --- Call (13 vars) ---
             comb['call_strike'] / close,
             comb['call_ttm'] if comb['call_ttm'] else 0,
             comb['call_real_value'] / close,
             comb['call_time_value'] / close,
-            self.target_gain,
+            self.target_gain, # Log Return
             comb['call_hv_160'],
             comb['call_iv'],
             comb['call_theta'],
@@ -843,13 +1107,14 @@ class single_Account:
             comb['call_gamma'],
             comb['call_delta'],
             comb['call_rho'],
-            1, 
+            1, # Flag
             
+            # --- Put (13 vars) ---
             comb['put_strike'] / close,
             comb['put_ttm'] if comb['put_ttm'] else 0,
             comb['put_real_value'] / close,
             comb['put_time_value'] / close,
-            self.target_gain,
+            self.target_gain, # Log Return
             comb['put_hv_160'],
             comb['put_iv'],
             comb['put_theta'],
@@ -857,14 +1122,47 @@ class single_Account:
             comb['put_gamma'],
             comb['put_delta'],
             comb['put_rho'],
-            -1 
+            -1 # Flag
         ]
         
         self.h_states.append(single)
         return current_state, self.get_history_state()
 
-
     def getReward(self, action: int, eps: float=1e-6):
+        if len(self.equity_list) <= 1: return 0.0
+        
+        prev, cur = self.equity_list[-2], self.equity_list[-1]
+        
+        # 使用对数收益率
+        step_ret = np.log((cur + eps) / (prev + eps))
+        
+        # 1. 基础收益
+        final_reward = step_ret * 80.0 
+
+        # 2. 差分回撤惩罚
+        peak = self.equity_peak
+        cur_dd = (peak - cur) / (peak + eps)
+        prev_dd = (peak - prev) / (peak + eps)
+        if cur_dd > prev_dd:
+            final_reward -= (cur_dd - prev_dd) * 50.0
+
+        # 3. 即时破产/重亏惩罚 (Step-level)
+        # 如果净值跌破初始资金的 70%，每步额外扣分，迫使模型在低净值时极其谨慎
+        if cur < self.init_capital * 0.7:
+            final_reward -= 0.1  # 每停留在破产线下一步，就持续扣分
+
+        # 4. 交易频率惩罚
+        if action in [1, 2]: 
+            final_reward -= 0.005 
+
+        # 5. 🔥 Reward Clipping (关键！)
+        # 将单步奖励限制在 [-1.5, 1.5] 之间
+        # 这样即使期权翻了 5 倍，模型收到的信号也不会炸裂，保证训练稳定性
+        final_reward = np.clip(final_reward, -1.5, 1.5)
+            
+        return float(final_reward)
+
+    def old_getReward(self, action: int, eps: float=1e-6):
             # 1. 基础收益 (Log Return)
             if len(self.equity_list) <= 1:
                 step_ret = 0.0
@@ -889,7 +1187,7 @@ class single_Account:
             k1 = 0
             if step_ret < 0:
                 k1 = 0.5 * final_reward
-                final_reward *= 1.5 # 亏钱时痛感加倍
+                # final_reward *= 1.5 # 亏钱时痛感加倍
 
             # 3. 破产/大回撤 终止惩罚 (这是稀疏信号，给重一点没事)
             k2 = 0

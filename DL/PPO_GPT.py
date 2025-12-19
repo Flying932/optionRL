@@ -26,7 +26,7 @@ from preTrain.preMOE import PreMOE
 from dataclasses import dataclass, field
 import random
 import multiprocessing as mp
-from finTool.single_window_account import single_Account  # 用于 DataCache 读取数据
+from finTool.single_window_account_fast import single_Account
 import os
 import traceback
 
@@ -685,6 +685,7 @@ def worker(remote, parent_remote, env_fn_wrapper, worker_cfg: Dict[str, Any]):
                 if equity_end is None:
                     equity_end = float("nan")
 
+                env_sharpe = env.account_controller.get_sharpe_ratio()
                 remote.send(("traj", {
                     "raw_curr": raw_curr,
                     "raw_hist": raw_hist,
@@ -698,6 +699,7 @@ def worker(remote, parent_remote, env_fn_wrapper, worker_cfg: Dict[str, Any]):
                     "valid": valid,
                     "last_value": np.array([last_value], np.float32),
                     "equity_end": np.array([equity_end], np.float32),
+                    "env_sharpe": env_sharpe, # 🔥 新增
                 }))
 
             elif cmd == "close":
@@ -720,305 +722,6 @@ def worker(remote, parent_remote, env_fn_wrapper, worker_cfg: Dict[str, Any]):
                 pass
             break
 
-
-def old_worker(remote, parent_remote, env_fn_wrapper, worker_cfg: Dict[str, Any]):
-    parent_remote.close()
-    try:
-        torch.set_num_threads(1)
-        torch.set_num_interop_threads(1)
-    except Exception:
-        pass
-
-    try:
-        env = env_fn_wrapper.x()
-    except Exception:
-        tb = traceback.format_exc()
-        remote.send(("__init_error__", tb))
-        remote.close()
-        return
-
-    # build extractor (CPU)
-    try:
-        extractor = PreMOE(
-            seq_len=worker_cfg["window_size"],
-            pred_len=worker_cfg["pre_len"],
-            n_variates=worker_cfg["n_variates"],
-            d_router=worker_cfg["d_router"],
-        ).to("cpu")
-        if worker_cfg.get("pretrained_path") and os.path.exists(worker_cfg["pretrained_path"]):
-            sd = torch.load(worker_cfg["pretrained_path"], map_location="cpu")
-            extractor.load_state_dict(sd, strict=True)
-        extractor.eval()
-        for p in extractor.parameters():
-            p.requires_grad = False
-    except Exception:
-        tb = traceback.format_exc()
-        remote.send(("__init_error__", tb))
-        remote.close()
-        return
-
-    feat = FeaturePipeline(extractor, device="cpu", adapter_dim=worker_cfg["adapter_dim"])
-    actor: Optional[ActorDualHead] = None
-    critic: Optional[ValueNet] = None
-
-    pending_payload: Optional[Dict[str, Any]] = None
-    adapter_dims: Optional[Dict[str, int]] = None
-
-    def ensure_policy(curr_np: np.ndarray, hist_np: np.ndarray):
-        nonlocal actor, critic, pending_payload, adapter_dims
-        curr = torch.from_numpy(curr_np).float().unsqueeze(0)
-        hist = torch.from_numpy(hist_np).float().unsqueeze(0)
-        s, dims = feat.obs_to_state_normed(curr, hist, update_norm=False)
-        adapter_dims = dims
-        state_dim = int(s.shape[-1])
-        if actor is None:
-            actor = ActorDualHead(state_dim, hidden_dim=worker_cfg["hidden_dim"]).to("cpu")
-            critic = ValueNet(state_dim, hidden_dim=worker_cfg["hidden_dim"]).to("cpu")
-        if pending_payload is not None:
-            apply_payload(pending_payload)
-            pending_payload = None
-
-    def apply_payload(payload: Dict[str, Any]):
-        nonlocal actor, critic, adapter_dims
-        if adapter_dims is None and payload.get("adapter_dims") is not None:
-            adapter_dims = payload["adapter_dims"]
-
-        if adapter_dims is not None:
-            feat.build_adapter_from_dims(adapter_dims)
-
-        if payload.get("norm_state") is not None:
-            feat.build_norm_if_needed(int(payload["norm_state"]["mean"].numel()))
-            assert feat.norm is not None
-            feat.norm.load_state_dict(payload["norm_state"], device="cpu")
-
-        if payload.get("adapter_state") is not None:
-            assert feat.adapter is not None
-            feat.adapter.load_state_dict(payload["adapter_state"], strict=True)
-
-        if actor is not None and payload.get("actor_state") is not None:
-            actor.load_state_dict(payload["actor_state"], strict=True)
-        if critic is not None and payload.get("critic_state") is not None:
-            critic.load_state_dict(payload["critic_state"], strict=True)
-
-    def sample_action_weight(state_1d: torch.Tensor) -> Tuple[int, int, float, float, float]:
-        assert actor is not None and critic is not None
-
-        # 强制推理模式：不建计算图、更快、更省内存
-        with torch.inference_mode():
-            logits_a, logits_w = actor(state_1d)
-            logits_a = logits_a.squeeze(0)
-            logits_w = logits_w.squeeze(0)
-
-            dist_a = Categorical(logits=logits_a)
-            a = int(dist_a.sample().item())
-            logp_a = float(dist_a.log_prob(torch.tensor(a, device=logits_a.device)).item())
-
-            allowed = torch.zeros(5, dtype=torch.bool, device=logits_w.device)
-            if a in (A_LONG, A_SHORT, A_CLOSE):
-                allowed[1:] = True
-                need_w = 1.0
-            else:
-                allowed[0] = True
-                need_w = 0.0
-
-            masked = logits_w.clone()
-            masked[~allowed] = -1e9
-            dist_w = Categorical(logits=masked)
-            wi = int(dist_w.sample().item())
-            logp_w = float(dist_w.log_prob(torch.tensor(wi, device=logits_w.device)).item())
-
-            wv = float(WEIGHT_BINS[wi])
-            logp_joint = logp_a + need_w * logp_w
-
-            v = float(critic(state_1d).squeeze(-1).item())
-
-        return a, wi, wv, logp_joint, v
-
-
-    def old_sample_action_weight(state_1d: torch.Tensor) -> Tuple[int, int, float, float, float]:
-        assert actor is not None and critic is not None
-        logits_a, logits_w = actor(state_1d)
-        logits_a = logits_a.squeeze(0)
-        logits_w = logits_w.squeeze(0)
-
-        dist_a = Categorical(logits=logits_a)
-        a = int(dist_a.sample().item())
-        logp_a = float(dist_a.log_prob(torch.tensor(a)).item())
-
-        allowed = torch.zeros(5, dtype=torch.bool)
-        if a in (A_LONG, A_SHORT, A_CLOSE):
-            allowed[1:] = True
-            need_w = 1.0
-        else:
-            allowed[0] = True
-            need_w = 0.0
-
-        masked = logits_w.clone()
-        masked[~allowed] = -1e9
-        dist_w = Categorical(logits=masked)
-        wi = int(dist_w.sample().item())
-        logp_w = float(dist_w.log_prob(torch.tensor(wi)).item())
-
-        wv = float(WEIGHT_BINS[wi])
-        logp_joint = logp_a + need_w * logp_w
-        v = float(critic(state_1d).squeeze(-1).item())
-        return a, wi, wv, logp_joint, v
-
-    while True:
-        try:
-            cmd, data = remote.recv()
-        except EOFError:
-            break
-
-        try:
-            if cmd == "__ping__":
-                remote.send(("__pong__", None))
-
-            elif cmd == "set_task":
-                idx = int(data)
-                if hasattr(env, "set_task"):
-                    env.set_task(idx)
-                remote.send(("ok", None))
-
-            elif cmd == "set_weights":
-                payload = data
-                if actor is None or critic is None or feat.adapter is None or feat.norm is None:
-                    pending_payload = payload
-                else:
-                    apply_payload(payload)
-                remote.send(("ok", None))
-
-            elif cmd == "rollout":
-                T = int(data["T"])
-
-                reset_out = env.reset()
-                if isinstance(reset_out, (tuple, list)) and len(reset_out) >= 2:
-                    curr_np, hist_np = reset_out[0], reset_out[1]
-                else:
-                    raise RuntimeError(f"env.reset unexpected: {type(reset_out)}")
-
-                curr_np = np.asarray(curr_np, np.float32)
-                hist_np = np.asarray(hist_np, np.float32)
-
-                ensure_policy(curr_np, hist_np)
-
-                Dc = int(curr_np.shape[-1])
-                L = int(hist_np.shape[-2])
-                Dh = int(hist_np.shape[-1])
-
-                raw_curr = np.zeros((T, Dc), np.float32)
-                raw_hist = np.zeros((T, L, Dh), np.float32)
-                actions = np.zeros((T,), np.int64)
-                w_idx = np.zeros((T,), np.int64)
-                w_val = np.zeros((T,), np.float32)
-                logp_old = np.zeros((T,), np.float32)
-                value_old = np.zeros((T,), np.float32)
-                rewards = np.zeros((T,), np.float32)
-                done = np.ones((T,), np.bool_)
-                valid = np.zeros((T,), np.bool_)
-
-                terminated_early = False
-
-                for t in range(T):
-                    raw_curr[t] = curr_np
-                    raw_hist[t] = hist_np
-
-                    if terminated_early:
-                        actions[t] = A_HOLD
-                        w_idx[t] = 0
-                        w_val[t] = 0.0
-                        logp_old[t] = 0.0
-                        value_old[t] = 0.0
-                        rewards[t] = 0.0
-                        done[t] = True
-                        valid[t] = False
-                        continue
-
-                    with torch.no_grad():
-                        curr = torch.from_numpy(curr_np).unsqueeze(0)
-                        hist = torch.from_numpy(hist_np).unsqueeze(0)
-                        s, _ = feat.obs_to_state_normed(curr, hist, update_norm=False)
-                        a, wi, wv, lp, v = sample_action_weight(s)
-
-                    step_out = env.step(a, wv)
-                    if isinstance(step_out, (tuple, list)) and len(step_out) >= 5:
-                        next_curr, next_hist, r, term, trunc = step_out[0], step_out[1], step_out[2], step_out[3], step_out[4]
-                    else:
-                        raise RuntimeError(f"env.step return length={len(step_out)} unexpected")
-
-                    d = bool(term or trunc)
-
-                    actions[t] = a
-                    w_idx[t] = wi
-                    w_val[t] = wv
-                    logp_old[t] = lp
-                    value_old[t] = v
-                    rewards[t] = float(r)
-                    done[t] = d
-                    valid[t] = True
-
-                    if d:
-                        terminated_early = True
-                        continue
-
-                    curr_np = np.asarray(next_curr, np.float32)
-                    hist_np = np.asarray(next_hist, np.float32)
-
-                # bootstrap last_value
-                if not terminated_early:
-                    with torch.no_grad():
-                        curr = torch.from_numpy(curr_np).unsqueeze(0)
-                        hist = torch.from_numpy(hist_np).unsqueeze(0)
-                        s_last, _ = feat.obs_to_state_normed(curr, hist, update_norm=False)
-                        assert critic is not None
-                        last_value = float(critic(s_last).squeeze(-1).item())
-                else:
-                    last_value = 0.0
-
-                # equity_end：尽量从 env.account_controller 取
-                equity_end = None
-                try:
-                    if hasattr(env, "account_controller") and hasattr(env.account_controller, "equity"):
-                        equity_end = float(env.account_controller.equity)
-                except Exception:
-                    equity_end = None
-                if equity_end is None:
-                    equity_end = float("nan")
-
-                remote.send(("traj", {
-                    "raw_curr": raw_curr,
-                    "raw_hist": raw_hist,
-                    "actions": actions,
-                    "w_idx": w_idx,
-                    "w_val": w_val,
-                    "logp_old": logp_old,
-                    "value_old": value_old,
-                    "rewards": rewards,
-                    "done": done,
-                    "valid": valid,
-                    "last_value": np.array([last_value], np.float32),
-                    "equity_end": np.array([equity_end], np.float32),
-                }))
-
-            elif cmd == "close":
-                try:
-                    env.close()
-                except Exception:
-                    pass
-                remote.send(("ok", None))
-                remote.close()
-                break
-
-            else:
-                raise NotImplementedError(cmd)
-
-        except Exception:
-            tb = traceback.format_exc()
-            try:
-                remote.send(("error", tb))
-            except Exception:
-                pass
-            break
 
 
 # =========================
@@ -1074,18 +777,33 @@ class SubprocVectorEnv:
                 raise RuntimeError(payload2)
 
     def rollout(self, T: int) -> List[Dict[str, Any]]:
+        # 1. 发送命令
         for r in self.remotes:
             r.send(("rollout", {"T": int(T)}))
 
         trajs = []
+        # 2. 逐个接收，接收完立刻断开引用，防止积压
         for r in self.remotes:
-            tag, payload = r.recv()
-            if tag == "error":
-                raise RuntimeError(payload)
-            if tag != "traj":
-                raise RuntimeError(f"unexpected tag from worker: {tag}")
-            trajs.append(payload)
+            try:
+                # recv 这一步是最耗内存的，因为它要反序列化 huge object
+                tag, payload = r.recv()
+                
+                if tag == "error":
+                    raise RuntimeError(payload)
+                if tag != "traj":
+                    raise RuntimeError(f"unexpected tag from worker: {tag}")
+                
+                trajs.append(payload)
+                
+                # 🔥 显式删除 payload 引用 (虽然 Python 有 GC，但显式删除更保险)
+                del payload 
+            except Exception as e:
+                # 遇到错误也要尝试把剩下的收完，防止死锁
+                print(f"[Error] Recv failed: {e}")
+                raise e
+                
         return trajs
+
 
     def close(self):
         if self.closed:
@@ -1122,7 +840,7 @@ class LearnerPPO:
         k_epochs: int,
         actor_lr: float = 3e-4,
         critic_lr: float = 5e-4,
-        check_path: str='./miniQMT/DL/checkout',
+        check_path: str='./miniQMT/DL/checkout/check_data_parallel.pt',
         update_mb_size: int=2048,
         total_epochs: int=1000,
     ):
@@ -1134,7 +852,8 @@ class LearnerPPO:
         self.adapter_dim = adapter_dim
         self.hidden_dim = hidden_dim
 
-        self.check_path = f'{check_path}/check_data_parallel.pt'
+        # self.check_path = f'{check_path}/check_data_parallel.pt'
+        self.check_path = check_path
         self.update_mb_size = update_mb_size
 
         # frozen extractor on GPU
@@ -1320,114 +1039,542 @@ class LearnerPPO:
 
     def update_from_trajs(self, trajs: List[Dict[str, Any]], target_kl: float = 0.015):
         """
-        returns: loss, kl, actor_loss, value_loss, entropy
-        关键改动：
-        - 不再把 mask 后的全部样本一次性放到 GPU
-        - 改为 mini-batch 分块 forward/backward
-        - norm_update=True 也分块执行，避免再 OOM
+        针对 110 Epoch 后的异常修正版：
+        1. 使用 Huber Loss 替换 MSE，平滑异常收益冲击
+        2. 进一步削减 Value 权重 (0.01)，增加熵权重 (0.02) 以打破 Hold/Close 僵局
+        3. 强制 Value Clipping
         """
-        assert self.actor is not None and self.critic is not None and self.adapter is not None
-        assert self.opt_actor is not None and self.opt_critic is not None and self.opt_adapter is not None
+        assert self.actor is not None and self.critic is not None
+        
+        # ---------------------------------------------------------------------
+        # 1. 统一堆叠 (CPU)
+        # ---------------------------------------------------------------------
+        def stack_key(key, dtype):
+            N = len(trajs)
+            if N == 0: return torch.tensor([], dtype=dtype)
+            first_val = trajs[0][key]
+            sample_shape = torch.as_tensor(first_val, dtype=dtype).shape
+            target_shape = list(sample_shape)
+            target_shape.insert(1, N)
+            out = torch.empty(target_shape, dtype=dtype)
+            for i, tr in enumerate(trajs):
+                out.select(1, i).copy_(torch.as_tensor(tr[key], dtype=dtype))
+            return out
 
-        T = int(trajs[0]["raw_curr"].shape[0])
-        N = len(trajs)
+        raw_curr  = stack_key("raw_curr", torch.float32)
+        raw_hist  = stack_key("raw_hist", torch.float32)
+        actions   = stack_key("actions", torch.long)
+        w_idx     = stack_key("w_idx", torch.long)
+        logp_old  = stack_key("logp_old", torch.float32)
+        value_old = stack_key("value_old", torch.float32)
+        rewards   = stack_key("rewards", torch.float32)
+        done      = stack_key("done", torch.float32)
+        valid     = stack_key("valid", torch.float32)
+        last_value = torch.stack([torch.as_tensor(tr["last_value"], dtype=torch.float32) for tr in trajs], dim=0).squeeze()
 
-        # ---------- stack on CPU (numpy) ----------
-        raw_curr = np.stack([tr["raw_curr"] for tr in trajs], axis=1).astype(np.float32)   # (T,N,Dc)
-        raw_hist = np.stack([tr["raw_hist"] for tr in trajs], axis=1).astype(np.float32)   # (T,N,L,Dh)
-        actions  = np.stack([tr["actions"]  for tr in trajs], axis=1).astype(np.int64)     # (T,N)
-        w_idx    = np.stack([tr["w_idx"]    for tr in trajs], axis=1).astype(np.int64)     # (T,N)
-        logp_old = np.stack([tr["logp_old"] for tr in trajs], axis=1).astype(np.float32)   # (T,N)
-        value_old= np.stack([tr["value_old"]for tr in trajs], axis=1).astype(np.float32)   # (T,N)
-        rewards  = np.stack([tr["rewards"]  for tr in trajs], axis=1).astype(np.float32)   # (T,N)
-        done     = np.stack([tr["done"]     for tr in trajs], axis=1).astype(np.float32)   # (T,N)
-        valid    = np.stack([tr["valid"]    for tr in trajs], axis=1).astype(np.float32)   # (T,N)
-        last_value = np.stack([tr["last_value"] for tr in trajs], axis=1).squeeze(0).astype(np.float32)  # (N,)
-
-        # ---------- GAE on CPU (padding-aware) ----------
-        # torch CPU tensors (小，不会慢到哪去)
-        v_old_t  = torch.from_numpy(value_old)     # (T,N)
-        rew_t    = torch.from_numpy(rewards)       # (T,N)
-        done_t   = torch.from_numpy(done)          # (T,N)
-        valid_t  = torch.from_numpy(valid)         # (T,N)
-        last_v   = torch.from_numpy(last_value)    # (N,)
-
+        # ---------------------------------------------------------------------
+        # 2. 计算 GAE
+        # ---------------------------------------------------------------------
+        T, N = raw_curr.shape[:2]
         with torch.no_grad():
             adv = torch.zeros((T, N), dtype=torch.float32)
             last_gae = torch.zeros((N,), dtype=torch.float32)
-
             for t in reversed(range(T)):
-                m = (1.0 - done_t[t]) * valid_t[t]
-                v_tp1 = last_v if t == T - 1 else v_old_t[t + 1]
-                delta = rew_t[t] + self.gamma * v_tp1 * m - v_old_t[t]
+                m = (1.0 - done[t]) * valid[t]
+                v_tp1 = last_value if t == T - 1 else value_old[t + 1]
+                delta = rewards[t] + self.gamma * v_tp1 * m - value_old[t]
                 last_gae = delta + self.gamma * self.gae_lambda * m * last_gae
-                adv[t] = last_gae * valid_t[t]
+                adv[t] = last_gae * valid[t]
+            ret = adv + value_old
 
-            ret = adv + v_old_t
+        # ---------------------------------------------------------------------
+        # 3. Flatten & Filter
+        # ---------------------------------------------------------------------
+        mask_flat = valid.view(-1) > 0.5
+        if not mask_flat.any(): return 0.0, 0.0, 0.0, 0.0, 0.0
+        
+        def flat_and_filter(tensor_in):
+            return tensor_in.flatten(0, 1)[mask_flat]
 
-            mask_np = (valid.reshape(-1) > 0.5)
-            if mask_np.sum() == 0:
-                return 0.0, 0.0, 0.0, 0.0, 0.0
+        curr_flat = flat_and_filter(raw_curr)
+        hist_flat = flat_and_filter(raw_hist)
+        act_flat  = flat_and_filter(actions)
+        widx_flat = flat_and_filter(w_idx)
+        logp_old_flat = flat_and_filter(logp_old)
+        value_old_flat = flat_and_filter(value_old)
+        adv_raw_flat = flat_and_filter(adv)
+        ret_flat  = flat_and_filter(ret)
 
-            adv_f = adv.reshape(-1)[mask_np]
-            ret_f = ret.reshape(-1)[mask_np]
-            adv_f = (adv_f - adv_f.mean()) / (adv_f.std() + 1e-8)
+        # 优势归一化与裁剪
+        adv_flat = (adv_raw_flat - adv_raw_flat.mean()) / (adv_raw_flat.std() + 1e-8)
+        adv_flat = torch.clamp(adv_flat, -5.0, 5.0)
 
-        # ---------- flatten (STAY ON CPU), only move mini-batch to GPU ----------
-        Dc = raw_curr.shape[-1]
-        L  = raw_hist.shape[2]
-        Dh = raw_hist.shape[3]
-
-        curr_flat = raw_curr.reshape(T * N, Dc)[mask_np]          # (M,Dc)  numpy float32
-        hist_flat = raw_hist.reshape(T * N, L, Dh)[mask_np]       # (M,L,Dh) numpy float32
-
-        act_flat  = actions.reshape(-1)[mask_np]                  # (M,) numpy int64
-        widx_flat = w_idx.reshape(-1)[mask_np]                    # (M,) numpy int64
-        logp_old_flat = logp_old.reshape(-1)[mask_np]             # (M,) numpy float32
-
-        # torch CPU (for easy indexing), then move per-batch
-        adv_flat_t = adv_f.contiguous()                           # CPU torch
-        ret_flat_t = ret_f.contiguous()                           # CPU torch
-
-        M = int(curr_flat.shape[0])
-
+        # ---------------------------------------------------------------------
+        # 4. PPO Training Loop
+        # ---------------------------------------------------------------------
+        M = curr_flat.shape[0]
         mb = self.update_mb_size
-
-        last_loss = 0.0
-        last_kl = 0.0
-        last_actor_loss = 0.0
-        last_value_loss = 0.0
-        last_entropy = 0.0
-
-        # ---------- PPO epochs (mini-batch) ----------
+        stats = {"loss": [], "kl": [], "actor_loss": [], "value_loss": [], "entropy": []}
+        
         for _ep in range(self.k_epochs):
-            perm = np.random.permutation(M)
-
-            kl_sum = 0.0
-            ent_sum = 0.0
-            al_sum = 0.0
-            vl_sum = 0.0
-            loss_sum = 0.0
-            cnt = 0
-
+            indices = torch.randperm(M)
+            epoch_kl = []
             for st in range(0, M, mb):
-                idx = perm[st:st + mb]
-                bsz = int(len(idx))
-                if bsz == 0:
-                    continue
+                idx = indices[st:st + mb]
+                if len(idx) == 0: continue
+                
+                curr_b = curr_flat[idx].to(self.device, non_blocking=True)
+                hist_b = hist_flat[idx].to(self.device, non_blocking=True)
+                act_b  = act_flat[idx].to(self.device, non_blocking=True)
+                widx_b = widx_flat[idx].to(self.device, non_blocking=True)
+                logp_old_b = logp_old_flat[idx].to(self.device, non_blocking=True)
+                adv_b  = adv_flat[idx].to(self.device, non_blocking=True)
+                ret_b  = ret_flat[idx].to(self.device, non_blocking=True)
+                v_old_b = value_old_flat[idx].to(self.device, non_blocking=True)
 
-                # move one mini-batch to GPU
-                curr_b = torch.from_numpy(curr_flat[idx]).to(self.device, non_blocking=True)
-                hist_b = torch.from_numpy(hist_flat[idx]).to(self.device, non_blocking=True)
+                _, s = self._build_state(curr_b, hist_b, norm_update=False)
+                logits_a, logits_w = self.actor(s)
+                
+                # Actor 逻辑
+                dist_a = Categorical(logits=logits_a)
+                new_logp_a = dist_a.log_prob(act_b)
+                ent_a = dist_a.entropy().mean()
 
-                act_b  = torch.from_numpy(act_flat[idx]).to(self.device, non_blocking=True).long()
-                widx_b = torch.from_numpy(widx_flat[idx]).to(self.device, non_blocking=True).long()
-                logp_old_b = torch.from_numpy(logp_old_flat[idx]).to(self.device, non_blocking=True).float()
+                need_w = ((act_b == 1) | (act_b == 2) | (act_b == 3)).float()
+                lw = logits_w.clone()
+                if need_w.sum() > 0:
+                    maskw = torch.zeros_like(lw, dtype=torch.bool)
+                    maskw[need_w.bool(), 1:] = True
+                    maskw[~need_w.bool(), 0] = True
+                    lw[~maskw] = -1e9
+                
+                dist_w = Categorical(logits=lw)
+                new_logp_w = dist_w.log_prob(widx_b)
+                ent_w = (need_w * dist_w.entropy()).sum() / (need_w.sum() + 1e-6)
 
-                adv_b = adv_flat_t[idx].to(self.device, non_blocking=True)
-                ret_b = ret_flat_t[idx].to(self.device, non_blocking=True)
+                logp_new = new_logp_a + need_w * new_logp_w
+                ratio = torch.exp(logp_new - logp_old_b)
 
-                # forward
+                surr1 = ratio * adv_b
+                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_b
+                actor_loss = -torch.min(surr1, surr2).mean()
+
+                # --- 🔥 改进：Huber Loss + Value Clipping ---
+                v_pred = self.critic(s).squeeze(-1)
+                v_pred_clipped = v_old_b + torch.clamp(v_pred - v_old_b, -self.clip_eps, self.clip_eps)
+                # 使用 Huber Loss (smooth_l1_loss) 对极端 Return 不敏感
+                v_loss1 = F.smooth_l1_loss(v_pred, ret_b)
+                v_loss2 = F.smooth_l1_loss(v_pred_clipped, ret_b)
+                value_loss = torch.max(v_loss1, v_loss2)
+
+                entropy = ent_a + 0.5 * ent_w
+                
+                # --- 🔥 总 Loss 计算 (进一步调低 VF 权重) ---
+                loss = actor_loss + 0.01 * value_loss - 0.02 * entropy
+                
+                self.opt_adapter.zero_grad(set_to_none=True)
+                self.opt_actor.zero_grad(set_to_none=True)
+                self.opt_critic.zero_grad(set_to_none=True)
+                loss.backward()
+                
+                # 梯度裁剪保持 0.5
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(self.adapter.parameters(), 0.5)
+                
+                self.opt_adapter.step()
+                self.opt_actor.step()
+                self.opt_critic.step()
+                
+                with torch.no_grad():
+                    kl_b = (logp_old_b - logp_new).mean().abs().item()
+                    epoch_kl.append(kl_b)
+                    stats["loss"].append(loss.item())
+                    stats["kl"].append(kl_b)
+                    stats["actor_loss"].append(actor_loss.item())
+                    stats["value_loss"].append(value_loss.item())
+                    stats["entropy"].append(entropy.item())
+
+            if (sum(epoch_kl)/len(epoch_kl)) > 1.5 * target_kl: break
+
+        # 更新 Norm & Scheduler
+        if M > 0:
+            with torch.no_grad():
+                for st in range(0, M, mb):
+                    self._build_state(curr_flat[st:st+mb].to(self.device), hist_flat[st:st+mb].to(self.device), norm_update=True)
+
+        self.scheduler_actor.step()
+        self.scheduler_critic.step()
+        self.scheduler_adapter.step()
+        
+        def get_avg(k): return sum(stats[k]) / len(stats[k]) if stats[k] else 0.0
+        return get_avg("loss"), get_avg("kl"), get_avg("actor_loss"), get_avg("value_loss"), get_avg("entropy")
+
+
+    def p_update_from_trajs(self, trajs: List[Dict[str, Any]], target_kl: float = 0.015):
+        """
+        重构完整版：
+        1. 加入 Value Clipping 防止价值网络预测炸裂导致 loss 飙升
+        2. 调整 Loss 权重分配 (VF Coeff=0.1, Entropy Coeff=0.01)
+        3. 全程使用 torch.stack/as_tensor 优化内存
+        """
+        assert self.actor is not None and self.critic is not None
+        
+        # ---------------------------------------------------------------------
+        # 1. 统一堆叠 (Stacking) - CPU 上完成，避免内存峰值
+        # ---------------------------------------------------------------------
+        def stack_key(key, dtype):
+            N = len(trajs)
+            if N == 0: return torch.tensor([], dtype=dtype)
+            
+            first_val = trajs[0][key]
+            sample_tensor = torch.as_tensor(first_val, dtype=dtype)
+            sample_shape = sample_tensor.shape
+            
+            target_shape = list(sample_shape)
+            target_shape.insert(1, N) # (T, N, ...)
+            
+            out = torch.empty(target_shape, dtype=dtype)
+            for i, tr in enumerate(trajs):
+                out.select(1, i).copy_(torch.as_tensor(tr[key], dtype=dtype))
+            return out
+
+        # 提取所有基础数据
+        raw_curr  = stack_key("raw_curr", torch.float32) # (T, N, Dc)
+        raw_hist  = stack_key("raw_hist", torch.float32) # (T, N, L, Dh)
+        actions   = stack_key("actions", torch.long)     # (T, N)
+        w_idx     = stack_key("w_idx", torch.long)       # (T, N)
+        logp_old  = stack_key("logp_old", torch.float32) # (T, N)
+        value_old = stack_key("value_old", torch.float32)# (T, N)
+        rewards   = stack_key("rewards", torch.float32)  # (T, N)
+        done      = stack_key("done", torch.float32)     # (T, N)
+        valid     = stack_key("valid", torch.float32)    # (T, N)
+        
+        last_value = torch.stack([torch.as_tensor(tr["last_value"], dtype=torch.float32) for tr in trajs], dim=0).squeeze()
+
+        T, N = raw_curr.shape[:2]
+
+        # ---------------------------------------------------------------------
+        # 2. 计算 GAE (CPU 计算)
+        # ---------------------------------------------------------------------
+        with torch.no_grad():
+            adv = torch.zeros((T, N), dtype=torch.float32)
+            last_gae = torch.zeros((N,), dtype=torch.float32)
+            
+            for t in reversed(range(T)):
+                # m: mask，只有在未完成且有效的步数才累积 GAE
+                m = (1.0 - done[t]) * valid[t]
+                v_tp1 = last_value if t == T - 1 else value_old[t + 1]
+                delta = rewards[t] + self.gamma * v_tp1 * m - value_old[t]
+                last_gae = delta + self.gamma * self.gae_lambda * m * last_gae
+                adv[t] = last_gae * valid[t]
+
+            # 这里的 ret 是 Critic 的拟合目标 (Returns)
+            ret = adv + value_old
+
+        # ---------------------------------------------------------------------
+        # 3. Flatten & Filter (基于 valid 过滤无效数据)
+        # ---------------------------------------------------------------------
+        mask_flat = valid.view(-1) > 0.5
+        if not mask_flat.any():
+            return 0.0, 0.0, 0.0, 0.0, 0.0
+        
+        def flat_and_filter(tensor_in):
+            return tensor_in.flatten(0, 1)[mask_flat]
+
+        curr_flat = flat_and_filter(raw_curr)
+        hist_flat = flat_and_filter(raw_hist)
+        act_flat  = flat_and_filter(actions)
+        widx_flat = flat_and_filter(w_idx)
+        logp_old_flat = flat_and_filter(logp_old)
+        value_old_flat = flat_and_filter(value_old) # 关键：用于 Value Clipping
+        adv_raw_flat = flat_and_filter(adv)
+        ret_flat  = flat_and_filter(ret)
+
+        # 优势归一化与强制裁剪 [-5, 5] 防止梯度爆炸
+        adv_flat = (adv_raw_flat - adv_raw_flat.mean()) / (adv_raw_flat.std() + 1e-8)
+        adv_flat = torch.clamp(adv_flat, -5.0, 5.0)
+
+        # 打印监控数据
+        with torch.no_grad():
+            x1 = (torch.abs(adv_flat) > 3.0).sum().item() / adv_flat.shape[0]
+            x2 = (torch.abs(adv_flat) > 2.0).sum().item() / adv_flat.shape[0]
+            x3 = (torch.abs(adv_flat) > 1.0).sum().item() / adv_flat.shape[0]
+            print(f"【Adv Ratio】 >3.0: {x1:.2%} | >2.0: {x2:.2%} | >1.0: {x3:.2%}")
+            print(f"Advantage Max: {adv_flat.max().item():.4f} | Min: {adv_flat.min().item():.4f}")
+
+        # ---------------------------------------------------------------------
+        # 4. PPO Training Loop (Mini-batch)
+        # ---------------------------------------------------------------------
+        M = curr_flat.shape[0]
+        mb = self.update_mb_size
+        stats = {"loss": [], "kl": [], "actor_loss": [], "value_loss": [], "entropy": []}
+        
+        for _ep in range(self.k_epochs):
+            indices = torch.randperm(M)
+            epoch_kl = []
+            
+            for st in range(0, M, mb):
+                idx = indices[st:st + mb]
+                if len(idx) == 0: continue
+                
+                # --- 异步加载到 GPU ---
+                curr_b = curr_flat[idx].to(self.device, non_blocking=True)
+                hist_b = hist_flat[idx].to(self.device, non_blocking=True)
+                act_b  = act_flat[idx].to(self.device, non_blocking=True)
+                widx_b = widx_flat[idx].to(self.device, non_blocking=True)
+                logp_old_b = logp_old_flat[idx].to(self.device, non_blocking=True)
+                adv_b  = adv_flat[idx].to(self.device, non_blocking=True)
+                ret_b  = ret_flat[idx].to(self.device, non_blocking=True)
+                v_old_b = value_old_flat[idx].to(self.device, non_blocking=True) # 用于计算 Value Clipping
+
+                # --- Actor Forward ---
+                _, s = self._build_state(curr_b, hist_b, norm_update=False)
+                logits_a, logits_w = self.actor(s)
+                
+                # Action A 分布
+                dist_a = Categorical(logits=logits_a)
+                new_logp_a = dist_a.log_prob(act_b)
+                ent_a = dist_a.entropy().mean()
+
+                # Weight Action 掩码逻辑
+                need_w = ((act_b == 1) | (act_b == 2) | (act_b == 3)).float() # 1:Long, 2:Short, 3:Close
+                lw = logits_w.clone()
+                if need_w.sum() > 0:
+                    maskw = torch.zeros_like(lw, dtype=torch.bool)
+                    maskw[need_w.bool(), 1:] = True
+                    maskw[~need_w.bool(), 0] = True
+                    lw[~maskw] = -1e9
+                
+                dist_w = Categorical(logits=lw)
+                new_logp_w = dist_w.log_prob(widx_b)
+                ent_w = (need_w * dist_w.entropy()).sum() / (need_w.sum() + 1e-6)
+
+                # 计算 PPO Ratio
+                logp_new = new_logp_a + need_w * new_logp_w
+                ratio = torch.exp(logp_new - logp_old_b)
+
+                # Actor Loss (Clipped Surrogate Objective)
+                surr1 = ratio * adv_b
+                surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_b
+                actor_loss = -torch.min(surr1, surr2).mean()
+
+                # --- 🔥 改进的 Critic Forward (Value Clipping) ---
+                v_pred = self.critic(s).squeeze(-1)
+                
+                # v_loss1: 原始 MSE
+                v_loss_unclipped = (v_pred - ret_b) ** 2
+                # v_loss2: 基于采样时旧 Value 的裁剪 MSE
+                v_pred_clipped = v_old_b + torch.clamp(v_pred - v_old_b, -self.clip_eps, self.clip_eps)
+                v_loss_clipped = (v_pred_clipped - ret_b) ** 2
+                
+                # 综合 Value Loss，取最大值能带来更稳健的梯度
+                value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+
+                # 熵正则化
+                entropy = ent_a + 0.5 * ent_w
+                
+                # --- 🔥 总 Loss 计算 (VF Coeff=0.1, Ent Coeff=0.01) ---
+                # 降低价值网络权重，从 0.5 降到 0.1，平滑由于 Return 波动带来的 loss 飙升
+                loss = actor_loss + 0.1 * value_loss - 0.01 * entropy
+                
+                # --- Backward & Step ---
+                self.opt_adapter.zero_grad(set_to_none=True)
+                self.opt_actor.zero_grad(set_to_none=True)
+                self.opt_critic.zero_grad(set_to_none=True)
+                
+                loss.backward()
+                
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                torch.nn.utils.clip_grad_norm_(self.adapter.parameters(), 0.5)
+                
+                self.opt_adapter.step()
+                self.opt_actor.step()
+                self.opt_critic.step()
+                
+                # 统计
+                with torch.no_grad():
+                    kl_b = (logp_old_b - logp_new).mean().abs().item()
+                    epoch_kl.append(kl_b)
+                    stats["loss"].append(loss.item())
+                    stats["kl"].append(kl_b)
+                    stats["actor_loss"].append(actor_loss.item())
+                    stats["value_loss"].append(value_loss.item())
+                    stats["entropy"].append(entropy.item())
+
+            # 早停检查
+            avg_kl = sum(epoch_kl) / len(epoch_kl) if epoch_kl else 0
+            if avg_kl > 1.5 * target_kl: break
+
+        # ---------------------------------------------------------------------
+        # 5. 更新状态归一化统计量 (RunningMeanStd)
+        # ---------------------------------------------------------------------
+        if M > 0:
+            with torch.no_grad():
+                for st in range(0, M, mb):
+                    idx = slice(st, min(st + mb, M))
+                    curr_b = curr_flat[idx].to(self.device, non_blocking=True)
+                    hist_b = hist_flat[idx].to(self.device, non_blocking=True)
+                    self._build_state(curr_b, hist_b, norm_update=True)
+
+        # 学习率 Scheduler 步进
+        self.scheduler_actor.step()
+        self.scheduler_critic.step()
+        self.scheduler_adapter.step()
+        
+        def get_avg(k):
+            return sum(stats[k]) / len(stats[k]) if stats[k] else 0.0
+
+        return get_avg("loss"), get_avg("kl"), get_avg("actor_loss"), get_avg("value_loss"), get_avg("entropy")
+
+
+    def old_update_from_trajs(self, trajs: List[Dict[str, Any]], target_kl: float = 0.015):
+        """
+        returns: loss, kl, actor_loss, value_loss, entropy
+        重构重点：
+        1. 全程移除 np.stack，全部改为 torch.stack/as_tensor，彻底解决 _ArrayMemoryError。
+        2. 统一数据流：List -> CPU Tensor -> Flatten & Filter -> GPU Mini-batch。
+        """
+        assert self.actor is not None and self.critic is not None
+        
+        # ---------------------------------------------------------------------
+        # 1. 统一堆叠 (Stacking) - 全部在 CPU 上完成，避免 Numpy 内存峰值
+        # ---------------------------------------------------------------------
+        # 辅助函数：处理不同类型的数据并转为 Tensor
+
+        def stack_key(key, dtype):
+            # --- 优化开始 ---
+            # 获取 trajs 的长度 (N)
+            N = len(trajs)
+            if N == 0:
+                return torch.tensor([], dtype=dtype)
+
+            # 1. 拿第一个元素来确定形状 (避免把所有元素都转成 Tensor 放在列表里)
+            # 注意：这里只转第一个，开销很小
+            first_val = trajs[0][key]
+            sample_tensor = torch.as_tensor(first_val, dtype=dtype)
+            sample_shape = sample_tensor.shape
+
+            # 2. 计算目标 Tensor 的形状
+            # 原代码是 dim=1，意味着在第 1 维插入 N
+            # 例如: 单个是 (T, L, Dh)，结果就是 (T, N, L, Dh)
+            target_shape = list(sample_shape)
+            target_shape.insert(1, N)
+
+            # 3. 预分配内存
+            # 使用 empty 分配内存比 zeros 快，因为我们要马上覆盖它
+            out = torch.empty(target_shape, dtype=dtype)
+
+            # 4. 逐个填充 (这是省内存的关键)
+            # 这样每次循环只处理一个 trajectory 的数据，处理完就释放中间变量
+            for i, tr in enumerate(trajs):
+                # out.select(1, i) 选中第 i 个切片，将数据 copy 进去
+                # torch.as_tensor 会尽可能共享内存，减少复制
+                val = tr[key]
+                # 如果 val 已经是 tensor 且设备与 out 一致，copy_ 很快
+                out.select(1, i).copy_(torch.as_tensor(val, dtype=dtype))
+                
+            return out
+        # --- 优化结束 ---
+
+        # 只要 trajs 里的 raw_hist 是 numpy array，torch.as_tensor 会很高效
+        raw_curr  = stack_key("raw_curr", torch.float32) # (T, N, Dc)
+        raw_hist  = stack_key("raw_hist", torch.float32) # (T, N, L, Dh)
+        
+        actions   = stack_key("actions", torch.long)     # (T, N)
+        w_idx     = stack_key("w_idx", torch.long)       # (T, N)
+        logp_old  = stack_key("logp_old", torch.float32) # (T, N)
+        value_old = stack_key("value_old", torch.float32)# (T, N)
+        rewards   = stack_key("rewards", torch.float32)  # (T, N)
+        done      = stack_key("done", torch.float32)     # (T, N)
+        valid     = stack_key("valid", torch.float32)    # (T, N)
+        
+        # last_value 处理稍微不同，它是 (N,)
+        last_value = torch.stack([torch.as_tensor(tr["last_value"], dtype=torch.float32) for tr in trajs], dim=0).squeeze()
+
+        T, N = raw_curr.shape[:2]
+
+        # ---------------------------------------------------------------------
+        # 2. 计算 GAE (仍在 CPU 上，计算量很小，不需要 GPU)
+        # ---------------------------------------------------------------------
+        with torch.no_grad():
+            adv = torch.zeros((T, N), dtype=torch.float32)
+            last_gae = torch.zeros((N,), dtype=torch.float32)
+            
+            # 这里的计算逻辑完全不需要改，但现在变量全是 Tensor 了
+            for t in reversed(range(T)):
+                m = (1.0 - done[t]) * valid[t]
+                v_tp1 = last_value if t == T - 1 else value_old[t + 1]
+                delta = rewards[t] + self.gamma * v_tp1 * m - value_old[t]
+                last_gae = delta + self.gamma * self.gae_lambda * m * last_gae
+                adv[t] = last_gae * valid[t]
+
+            ret = adv + value_old
+
+            # -----------------------------------------------------------------
+            # 3. Flatten & Filter (基于 valid mask 过滤无效步)
+            # -----------------------------------------------------------------
+            # 创建 bool mask (T*N)
+            mask_flat = valid.view(-1) > 0.5
+            if not mask_flat.any():
+                return 0.0, 0.0, 0.0, 0.0, 0.0
+            
+            # 定义 Flatten 函数
+            def flat_and_filter(tensor_in):
+                # reshape 到 (T*N, ...) 然后取 mask
+                return tensor_in.flatten(0, 1)[mask_flat]
+
+            # 大块内存操作：这里会产生一份新的过滤后的内存，但因为过滤掉了无效数据，通常比原数据小
+            curr_flat = flat_and_filter(raw_curr)       # (M, Dc)
+            hist_flat = flat_and_filter(raw_hist)       # (M, L, Dh)
+            act_flat  = flat_and_filter(actions)        # (M,)
+            widx_flat = flat_and_filter(w_idx)          # (M,)
+            logp_old_flat = flat_and_filter(logp_old)   # (M,)
+            adv_flat  = flat_and_filter(adv)            # (M,)
+            ret_flat  = flat_and_filter(ret)            # (M,)
+
+            # 归一化 Advantage
+            adv_flat = (adv_flat - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+        
+        advs = adv_flat
+        adv_flat = torch.clamp(advs, -5.0, 5.0)
+        x1 = (torch.abs(advs) > 3.0).sum().item() / advs.shape[0]
+        x2 = (torch.abs(advs) > 2.0).sum().item() / advs.shape[0]
+        x3 = (torch.abs(advs) > 1.0).sum().item() / advs.shape[0]
+        print(f"【Ratio】 (abs(adv) > 3.0 | 2.0 | 1.0) : {x1} | {x2} | {x3}")
+        print(f"Advantage Max: {advs.max().item():.4f} | Min: {advs.min().item():.4f} | Mean: {advs.mean().item():.4f}")
+
+        # ---------------------------------------------------------------------
+        # 4. PPO Training Loop (Mini-batch)
+        # ---------------------------------------------------------------------
+        M = curr_flat.shape[0] # 有效样本总数
+        mb = self.update_mb_size
+        
+        # 记录器
+        stats = {"loss": [], "kl": [], "actor_loss": [], "value_loss": [], "entropy": []}
+        
+        for _ep in range(self.k_epochs):
+            # 生成随机索引
+            indices = torch.randperm(M)
+            
+            epoch_kl = []
+            
+            for st in range(0, M, mb):
+                idx = indices[st:st + mb]
+                if len(idx) == 0: continue
+                
+                # --- Move to GPU (显存只在这里消耗) ---
+                curr_b = curr_flat[idx].to(self.device, non_blocking=True)
+                hist_b = hist_flat[idx].to(self.device, non_blocking=True)
+                act_b  = act_flat[idx].to(self.device, non_blocking=True)
+                widx_b = widx_flat[idx].to(self.device, non_blocking=True)
+                logp_old_b = logp_old_flat[idx].to(self.device, non_blocking=True)
+                adv_b  = adv_flat[idx].to(self.device, non_blocking=True)
+                ret_b  = ret_flat[idx].to(self.device, non_blocking=True)
+                
+                # --- Forward ---
+                # norm_update=False: 训练阶段不更新 running_mean/std，保持稳定
                 _, s = self._build_state(curr_b, hist_b, norm_update=False)
 
                 logits_a, logits_w = self.actor(s)
@@ -1435,14 +1582,21 @@ class LearnerPPO:
                 new_logp_a = dist_a.log_prob(act_b)
                 ent_a = dist_a.entropy().mean()
 
+                # Weight Action 处理逻辑
                 need_w = ((act_b == A_LONG) | (act_b == A_SHORT) | (act_b == A_CLOSE)).float()
-
-                lw = logits_w.clone()
-                maskw = torch.zeros_like(lw, dtype=torch.bool)
-                maskw[need_w.bool(), 1:] = True
-                maskw[~need_w.bool(), 0] = True
-                lw[~maskw] = -1e9
-
+                
+                # 优化 maskw 的创建，避免 clone 整个 logits
+                lw = logits_w  # 如果不需要 inplace 修改，直接用
+                # 这里为了安全还是 clone 一下，防止 inplace 报错，但操作可以简化
+                if need_w.sum() > 0:
+                    # 只有当需要处理权重时才进行复杂的 mask 操作
+                    # (由于你的逻辑比较特殊，这里保留原逻辑，但加上 clone)
+                    lw = logits_w.clone()
+                    maskw = torch.zeros_like(lw, dtype=torch.bool)
+                    maskw[need_w.bool(), 1:] = True
+                    maskw[~need_w.bool(), 0] = True
+                    lw[~maskw] = -1e9
+                
                 dist_w = Categorical(logits=lw)
                 new_logp_w = dist_w.log_prob(widx_b)
                 ent_w = (need_w * dist_w.entropy()).sum() / (need_w.sum() + 1e-6)
@@ -1455,191 +1609,68 @@ class LearnerPPO:
                 actor_loss = -torch.min(surr1, surr2).mean()
 
                 v_pred = self.critic(s).squeeze(-1)
+                
                 value_loss = F.mse_loss(v_pred, ret_b)
 
                 entropy = ent_a + 0.5 * ent_w
                 loss = actor_loss + 0.5 * value_loss - 0.005 * entropy
-
-                # backward
+                
+                # --- Backward ---
                 self.opt_adapter.zero_grad(set_to_none=True)
                 self.opt_actor.zero_grad(set_to_none=True)
                 self.opt_critic.zero_grad(set_to_none=True)
-
+                
                 loss.backward()
+                
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
                 torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                 torch.nn.utils.clip_grad_norm_(self.adapter.parameters(), 0.5)
-
+                
                 self.opt_adapter.step()
                 self.opt_actor.step()
                 self.opt_critic.step()
-
+                
+                # Stats
                 with torch.no_grad():
-                    kl_b = (logp_old_b - logp_new).mean().abs()
+                    kl_b = (logp_old_b - logp_new).mean().abs().item()
+                    epoch_kl.append(kl_b)
+                    
+                    stats["loss"].append(loss.item())
+                    stats["kl"].append(kl_b)
+                    stats["actor_loss"].append(actor_loss.item())
+                    stats["value_loss"].append(value_loss.item())
+                    stats["entropy"].append(entropy.item())
 
-                # accumulate stats
-                cnt += bsz
-                kl_sum += float(kl_b.item()) * bsz
-                ent_sum += float(entropy.item()) * bsz
-                al_sum += float(actor_loss.item()) * bsz
-                vl_sum += float(value_loss.item()) * bsz
-                loss_sum += float(loss.item()) * bsz
-
-                # 早停 KL（按 mini-batch 也能工作）
-                if kl_b > 1.5 * target_kl:
-                    break
-
-            # epoch summary
-            if cnt > 0:
-                last_kl = kl_sum / cnt
-                last_entropy = ent_sum / cnt
-                last_actor_loss = al_sum / cnt
-                last_value_loss = vl_sum / cnt
-                last_loss = loss_sum / cnt
-
-            # 如果 KL 已经超了，直接结束 k_epochs
-            if last_kl > 1.5 * target_kl:
+            # Early Stopping Check (Epoch Level)
+            avg_kl = sum(epoch_kl) / len(epoch_kl) if epoch_kl else 0
+            if avg_kl > 1.5 * target_kl:
                 break
+        
+        # ---------------------------------------------------------------------
+        # 5. Update Norm Stats (单独一轮，不再计算梯度，仅更新 Running Mean/Std)
+        # ---------------------------------------------------------------------
+        # 这一步如果不做 backward，其实非常快
+        if M > 0:
+            with torch.no_grad():
+                # 不需要 shuffle，直接顺序过一遍
+                for st in range(0, M, mb):
+                    idx = slice(st, min(st + mb, M))
+                    curr_b = curr_flat[idx].to(self.device, non_blocking=True)
+                    hist_b = hist_flat[idx].to(self.device, non_blocking=True)
+                    # 只要前向传播，Adapter 内部的 RunningMeanStd 就会更新
+                    self._build_state(curr_b, hist_b, norm_update=True)
 
-        # ---------- update norm AFTER update (chunked, no_grad) ----------
-        # 注意：这里会跑 adapter（需要它把 tok -> raw），但 no_grad 不建图，且分块不会炸显存
-        with torch.no_grad():
-            for st in range(0, M, mb):
-                idx = slice(st, min(st + mb, M))
-                curr_b = torch.from_numpy(curr_flat[idx]).to(self.device, non_blocking=True)
-                hist_b = torch.from_numpy(hist_flat[idx]).to(self.device, non_blocking=True)
-                self._build_state(curr_b, hist_b, norm_update=True)
-
-        # 学习率衰减
+        # Learning Rate Schedule
         self.scheduler_actor.step()
         self.scheduler_critic.step()
         self.scheduler_adapter.step()
+        
+        # Helper to get average
+        def get_avg(k):
+            return sum(stats[k]) / len(stats[k]) if stats[k] else 0.0
 
-        return last_loss, last_kl, last_actor_loss, last_value_loss, last_entropy
-
-
-    def old_update_from_trajs(self, trajs: List[Dict[str, Any]], target_kl: float = 0.03):
-        """`
-        returns: loss, kl, actor_loss, value_loss, entropy
-        """
-        assert self.actor is not None and self.critic is not None and self.adapter is not None
-        assert self.opt_actor is not None and self.opt_critic is not None and self.opt_adapter is not None
-
-        T = int(trajs[0]["raw_curr"].shape[0])
-        N = len(trajs)
-
-        raw_curr = np.stack([tr["raw_curr"] for tr in trajs], axis=1)
-        raw_hist = np.stack([tr["raw_hist"] for tr in trajs], axis=1)
-        actions = np.stack([tr["actions"] for tr in trajs], axis=1)
-        w_idx = np.stack([tr["w_idx"] for tr in trajs], axis=1)
-        logp_old = np.stack([tr["logp_old"] for tr in trajs], axis=1)
-        value_old = np.stack([tr["value_old"] for tr in trajs], axis=1)
-        rewards = np.stack([tr["rewards"] for tr in trajs], axis=1)
-        done = np.stack([tr["done"] for tr in trajs], axis=1)
-        valid = np.stack([tr["valid"] for tr in trajs], axis=1)
-        last_value = np.stack([tr["last_value"] for tr in trajs], axis=1).squeeze(0)
-
-        curr_t = torch.from_numpy(raw_curr).to(self.device)
-        hist_t = torch.from_numpy(raw_hist).to(self.device)
-        act_t = torch.from_numpy(actions).to(self.device).long()
-        widx_t = torch.from_numpy(w_idx).to(self.device).long()
-        logp_old_t = torch.from_numpy(logp_old).to(self.device).float()
-        v_old_t = torch.from_numpy(value_old).to(self.device).float()
-        rew_t = torch.from_numpy(rewards).to(self.device).float()
-        done_t = torch.from_numpy(done.astype(np.float32)).to(self.device).float()
-        valid_t = torch.from_numpy(valid.astype(np.float32)).to(self.device).float()
-        last_v = torch.from_numpy(last_value).to(self.device).float()
-
-        # ---- GAE (padding-aware) ----
-        with torch.no_grad():
-            adv = torch.zeros((T, N), device=self.device)
-            last_gae = torch.zeros((N,), device=self.device)
-
-            for t in reversed(range(T)):
-                m = (1.0 - done_t[t]) * valid_t[t]
-                v_tp1 = last_v if t == T - 1 else v_old_t[t + 1]
-                delta = rew_t[t] + self.gamma * v_tp1 * m - v_old_t[t]
-                last_gae = delta + self.gamma * self.gae_lambda * m * last_gae
-                adv[t] = last_gae * valid_t[t]
-
-            ret = adv + v_old_t
-
-            mask = (valid_t.view(-1) > 0.5)
-            adv_f = adv.view(-1)[mask]
-            ret_f = ret.view(-1)[mask]
-            act_f = act_t.view(-1)[mask]
-            widx_f = widx_t.view(-1)[mask]
-            logp_old_f = logp_old_t.view(-1)[mask]
-
-            curr_f = curr_t.view(T * N, -1)[mask]
-            hist_f = hist_t.view(T * N, hist_t.shape[2], hist_t.shape[3])[mask]
-
-            adv_f = (adv_f - adv_f.mean()) / (adv_f.std() + 1e-8)
-
-        last_loss = 0.0
-        last_kl = 0.0
-        last_actor_loss = 0.0
-        last_value_loss = 0.0
-        last_entropy = 0.0
-
-        for _ in range(self.k_epochs):
-            raw_state, s = self._build_state(curr_f, hist_f, norm_update=False)
-
-            logits_a, logits_w = self.actor(s)
-            dist_a = Categorical(logits=logits_a)
-            new_logp_a = dist_a.log_prob(act_f)
-            ent_a = dist_a.entropy().mean()
-
-            need_w = ((act_f == A_LONG) | (act_f == A_SHORT) | (act_f == A_CLOSE)).float()
-
-            lw = logits_w.clone()
-            maskw = torch.zeros_like(lw, dtype=torch.bool)
-            maskw[need_w.bool(), 1:] = True
-            maskw[~need_w.bool(), 0] = True
-            lw[~maskw] = -1e9
-
-            dist_w = Categorical(logits=lw)
-            new_logp_w = dist_w.log_prob(widx_f)
-            ent_w = (need_w * dist_w.entropy()).sum() / (need_w.sum() + 1e-6)
-
-            logp_new = new_logp_a + need_w * new_logp_w
-            ratio = torch.exp(logp_new - logp_old_f)
-
-            surr1 = ratio * adv_f
-            surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_f
-            actor_loss = -torch.min(surr1, surr2).mean()
-
-            v_pred = self.critic(s).squeeze(-1)
-            value_loss = F.mse_loss(v_pred, ret_f)
-
-            entropy = ent_a + 0.5 * ent_w
-            loss = actor_loss + 0.5 * value_loss - 0.01 * entropy
-
-            self.opt_adapter.zero_grad()
-            self.opt_actor.zero_grad()
-            self.opt_critic.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
-            self.opt_adapter.step()
-            self.opt_actor.step()
-            self.opt_critic.step()
-
-            with torch.no_grad():
-                kl = (logp_old_f - logp_new).mean().abs()
-                last_loss = float(loss.item())
-                last_kl = float(kl.item())
-                last_actor_loss = float(actor_loss.item())
-                last_value_loss = float(value_loss.item())
-                last_entropy = float(entropy.item())
-                if kl > 1.5 * target_kl:
-                    break
-
-        # update norm AFTER update
-        with torch.no_grad():
-            _raw2, _ = self._build_state(curr_f, hist_f, norm_update=True)
-
-        return last_loss, last_kl, last_actor_loss, last_value_loss, last_entropy
-
+        return get_avg("loss"), get_avg("kl"), get_avg("actor_loss"), get_avg("value_loss"), get_avg("entropy")
+   
 
 
 # =========================
@@ -1667,18 +1698,22 @@ class AgentConfig:
     pre_len: int = 4
     n_variates: int = 13
     d_router: int = 128
-    adapter_dim: int = 128
-    hidden_dim: int = 256
+    # adapter_dim: int = 128
+    adapter_dim: int = 256
+
+    # hidden_dim: int = 256
+    hidden_dim: int = 512
     pretrained_path: str = "./miniQMT/DL/preTrain/weights/preMOE_best_dummy_data_32_4.pth"
 
     # PPO
     gamma: float = 0.99
     gae_lambda: float = 0.95
-    clip_eps: float = 0.1
-    k_epochs: int = 10
+    clip_eps: float = 0.2
+    k_epochs: int = 15
     epochs: int = 50,
-    actor_lr: float = 2e-4
+    actor_lr: float = 3e-4
     critic_lr: float = 5e-4
+    check_path: str = './miniQMT/DL/checkout/check_data_parallel.pt'
 
     # logging
     save_excel: bool = False
@@ -1713,6 +1748,7 @@ class Agent:
             total_epochs = cfg.epochs,
             actor_lr=cfg.actor_lr,
             critic_lr=cfg.critic_lr,
+            check_path=cfg.check_path
         )
 
         # build vector env
@@ -1763,6 +1799,10 @@ class Agent:
             'hold_ratio': [], 'long_ratio': [], 'short_ratio': [], 'close_ratio': [],
             'actor_loss': [], 'value_loss': [], 'entropy': [],
             'ratio_0': [], 'ratio_25': [], 'ratio_50': [], 'ratio_75': [], 'ratio_100': [],
+            'sharpe': [],
+            'right_sharpe_ratio': [],
+            'golden_task_count': [],   # ✅ 新增：进入黄金区间的任务数量
+            'gambling_task_count': [], # ✅ 新增：在赌博区间的任务数量
         }
 
         # Warmup Normalization (修复版)
@@ -1785,6 +1825,9 @@ class Agent:
         # 强制更新 Norm
         self.learner._build_state(c_t, h_t, norm_update=True)
         print(f"[Info] Warmup done. Norm counts: {self.learner.norm.running_ms.n}")
+
+
+
 
     def train_dynamic(self, from_check_point: bool = False):
         if from_check_point:
@@ -1945,31 +1988,33 @@ class Agent:
         sys.stdout.flush() # 强制将缓冲区写入磁盘
 
         for ep in range(self.cfg.epochs):
-            if from_check_point and start_epoch is not None and ep < start_epoch:
+            if from_check_point and start_epoch is not None and ep <= start_epoch:
                 print(f'[Skip] epoch = {ep}')
                 continue
 
             t0 = time.time()
         
-            # 阶梯式 Fee Warm-up
-            if ep < 50:
-                current_fee = 0.0
-            elif ep < 100:
-                current_fee = 0.3  # 先给点小压力
-            elif ep < 150:
-                current_fee = 0.6
-            else:
-                current_fee = self.cfg.fee # 最终 1.3
+            # # 阶梯式 Fee Warm-up
+            # if ep < 5:
+            #     current_fee = 0.0
+            # elif ep < 10:
+            #     current_fee = 0.8  # 先给点小压力
+            # elif ep < 15:
+            #     current_fee = 1.0
+            # else:
+            #     current_fee = self.cfg.fee # 最终 1.3
             
-            if ep % 50 == 0: # 每50轮打印并同步一次即可
-                 print(f"[Curriculum-warmup] Set Fee to {current_fee}")
-                 self.vec_env.set_fee_all(current_fee)
+            if ep == 0 or ep == 1: # 每50轮打印并同步一次即可
+                #  print(f"[Curriculum-warmup] Set Fee to {current_fee}")
+                #  self.vec_env.set_fee_all(current_fee)
+                 self.vec_env.set_fee_all(1.3)
 
             # 本轮累计的组 steps（按你要求用“组内 steps 总和”来判断是否够 8192）
             sampled_steps_sum = 0
 
             # 收集到的 traj（注意：每次抽组会返回 workers 条，但最后一组可能 < workers，我们会丢弃 padding 部分）
             collected_trajs = []
+            epoch_all_env_sharpes = []
 
             # 统计（按 valid 统计）
             total_reward_sum = 0.0
@@ -1982,11 +2027,23 @@ class Agent:
 
             total_annual_ret_sum = 0.0
             count = 0
+            task_sharpe_tracker = {} # {task_id: [sr1, sr2, ...]}
             # 反复抽组直到累计组 steps >= rollout_T_big
             while sampled_steps_sum < rollout_T_big:
                 g_idx = sample_group_index()
                 group = groups[g_idx]
                 true_cnt = len(group)
+
+                task_ids_raw = group.copy()
+
+                # 【新增】预判逻辑：如果加上这组会超过目标太多(比如1.1倍)，且当前已经有不少数据了，就跳过这组或直接 break
+                # 防止内存压力太大
+                if sampled_steps_sum > rollout_T_big * 0.8 and (sampled_steps_sum + group_sum_steps[g_idx]) > rollout_T_big * 1.2:
+                     # 这一组太大，容易爆内存，换一组小的试试，或者直接 break
+                    if sampled_steps_sum >= rollout_T_big: 
+                        break
+                    continue
+
 
                 # 组贡献的“长度”（采样概率/累计步数使用 sum steps）
                 sampled_steps_sum += int(group_sum_steps[g_idx])
@@ -2020,12 +2077,22 @@ class Agent:
                 trajs = trajs[:true_cnt]
                 collected_trajs.extend(trajs)
 
+            # ✅ 新增：将夏普归类到具体的 Task ID 下
+                for tid, tr in zip(task_ids_raw, trajs):
+                    sr = tr.get("env_sharpe", 0.0)
+                    if tid not in task_sharpe_tracker:
+                        task_sharpe_tracker[tid] = []
+                    task_sharpe_tracker[tid].append(sr)
+                    epoch_all_env_sharpes.append(sr)
+
                 # 年化(252交易日, 1天8个30分钟K线)
                 STEPS_PER_YEAR = 252 * 8
 
-
                 # 统计（只统计 valid 的部分）
                 for tr in trajs:
+                    es = tr.get("env_sharpe", 0.0)
+                    epoch_all_env_sharpes.append(es)
+
                     valid = np.asarray(tr["valid"], dtype=np.bool_)
                     valid_steps = valid.sum()
 
@@ -2053,22 +2120,90 @@ class Agent:
                                 annual_ret = abs_ret * (STEPS_PER_YEAR / valid_steps)
                                 total_annual_ret_sum += annual_ret
                                 count += 1
-                                
 
+            # --- 🔥 核心改进：在 while 循环结束后，进行任务画像分析 ---
+            task_analysis = {"golden": [], "gambling": [], "failing": [], "normal": []}
+            task_avg_srs = {}
+            for tid, srs in task_sharpe_tracker.items():
+                avg_sr = np.mean(srs)
+                task_avg_srs[tid] = avg_sr.item()
+                if 1.0 <= avg_sr <= 2.5:
+                    task_analysis["golden"].append(tid)
+                elif avg_sr > 3.0:
+                    task_analysis["gambling"].append(tid)
+                elif avg_sr < 0.5:
+                    task_analysis["failing"].append(tid)
+                else:
+                    task_analysis["normal"].append(tid)
+
+            # 打印详细任务报告
+            print(f"\n--- 📊 Task Performance Report (Epoch {ep+1}) ---")
+            print(f"✅ [Golden] (1.0<=SR<=2.5) 数量: {len(task_analysis['golden'])} | IDs: {task_analysis['golden']}")
+            print(f"🚀 [Gambling] (SR > 3.0) 数量: {len(task_analysis['gambling'])} | IDs: {task_analysis['gambling']}")
+            print(f"📉 [Failing] (SR < 0.5) 数量: {len(task_analysis['failing'])} | IDs: {task_analysis['failing'][:10]}...")
             
+            # 找到表现最好和最差的 3 个组合
+            sorted_tasks = sorted(task_avg_srs.items(), key=lambda x: x[1], reverse=True)
+            if sorted_tasks:
+                print(f"🏆 顶梁柱 Top 3 (ID, SR): {sorted_tasks[:3]}")
+                print(f"💀 拖后腿 Bottom 3 (ID, SR): {sorted_tasks[-3:]}")
+            print(f"--------------------------------------------\n")
+
+            # 🔥 3. 在 while 循环结束后，计算全体统计量
+            if len(epoch_all_env_sharpes) > 0:
+                sr_mean = np.mean(epoch_all_env_sharpes)
+                sr_max = np.max(epoch_all_env_sharpes)
+                sr_min = np.min(epoch_all_env_sharpes)
+            else:
+                sr_mean = sr_max = sr_min = 0.0   
+
+            sp_cnt = 0
+            for sp in epoch_all_env_sharpes:
+                if sp >= 1.0 and sp <= 2.0:
+                    sp_cnt += 1
+            sp_cnt = sp_cnt / len(epoch_all_env_sharpes)
 
             # -------------------------
             # 4) PPO update：把所有 collected_trajs pad 到 Tmax 后一次更新
             # -------------------------
 
+            # 1. 先计算最大长度 Tmax
+            # 注意：这里只读 shape，不复制数据，很快且不占内存
             Tmax = max(int(tr["raw_curr"].shape[0]) for tr in collected_trajs)
-            trajs_for_update = [pad_traj_to_T(tr, Tmax) for tr in collected_trajs]
 
-            valid_lens = [int(tr["valid"].sum()) for tr in collected_trajs]
+            # 2. 逐个处理并释放旧数据 (关键修改)
+            trajs_for_update = []
+            
+            # 使用 while 循环配合 pop(0)，处理一个就扔掉一个原始数据
+            # 这样内存始终只维持一份数据，不会翻倍
+            while collected_trajs:
+                # 弹出第一个原始轨迹 (collected_trajs 长度 -1)
+                tr = collected_trajs.pop(0) 
+                
+                # 生成 Padding 后的新轨迹
+                padded_tr = pad_traj_to_T(tr, Tmax)
+                
+                # 加入新列表
+                trajs_for_update.append(padded_tr)
+                
+                # 显式删除引用，告诉 Python "这块旧内存可以释放了"
+                del tr
+            
+            # 3. 强制触发垃圾回收，整理内存碎片
+            import gc
+            gc.collect()
+
+
+            # trajs_for_update = [pad_traj_to_T(tr, Tmax) for tr in collected_trajs]
+
+            valid_lens = [int(tr["valid"].sum()) for tr in trajs_for_update]
             # print("valid_len min/mean/max:", min(valid_lens), sum(valid_lens)/len(valid_lens), max(valid_lens))
 
-            rs = np.concatenate([tr["rewards"][tr["valid"].astype(bool)] for tr in collected_trajs])
-            # print("scaled reward mean/std/min/max:", rs.mean(), rs.std(), rs.min(), rs.max())
+            rs = np.concatenate([
+                            tr["rewards"][tr["valid"].astype(bool)] 
+                            for tr in trajs_for_update
+                        ])
+            print("[Info] Scaled reward mean/std/min/max:", rs.mean(), rs.std(), rs.min(), rs.max())
 
             loss, kl, a_loss, v_loss, ent = self.learner.update_from_trajs(trajs_for_update)
 
@@ -2096,6 +2231,8 @@ class Agent:
             else:
                 w_ratios = [float(weight_counts[k] / w_total) for k in range(5)]
 
+            self.records["sharpe"].append(float(sr_mean))
+            self.records["right_sharpe_ratio"].append(sp_cnt)
             self.records["epoch"].append(ep + 1)
             self.records["reward"].append(float(avg_reward))
             self.records["avg_equity"].append(float(avg_equity))
@@ -2117,12 +2254,18 @@ class Agent:
             self.records["ratio_75"].append(float(w_ratios[3]))
             self.records["ratio_100"].append(float(w_ratios[4]))
 
+            self.records["golden_task_count"].append(len(task_analysis["golden"]))
+            self.records["gambling_task_count"].append(len(task_analysis["gambling"]))
+
+
             dt = time.time() - t0
             print(
                 f"[Epoch {ep+1} / {self.cfg.epochs}] "
                 f"sampled_group_steps={sampled_steps_sum} target={rollout_T_big} | "
                 f"valid_steps={total_valid_steps} | "
-                f"Reward:{avg_reward:.6f} | Market_value:{avg_equity:.2f} | "
+                f"Reward:{avg_reward:.6f} | Market_value:{avg_equity:.2f} \n"
+                f"Sharpe Ratio -> Mean: {sr_mean:.4f} | Max: {sr_max:.4f} | Min: {sr_min:.4f} | "
+                f"Sharpe Ratio Percent(1.0~2.0) -> Ratio: {sp_cnt:.4f}\n"
                 f"loss={loss:.4f} kl={kl:.4f} | "
                 f"act(H/L/S/C)={hold_ratio:.2f}/{long_ratio:.2f}/{short_ratio:.2f}/{close_ratio:.2f} | "
                 f"entropy={ent:.3f} time={dt:.1f}s"
@@ -2136,12 +2279,21 @@ class Agent:
                     df_old = pd.read_excel(self.cfg.excel_path)
                     df_combined = pd.concat([df_old, pd.DataFrame(self.records)], ignore_index=True)
                     df_combined.to_excel(self.cfg.excel_path, index=False)
+            
+            # 保存断点
+            self.learner.save(ep, best_reward)
+            print(f'>>> 🌟 Model updated, saved, epoch = {ep}, best_ward = {best_reward}')
+
+            # B. 每 50 个 Epoch 强制备份一个历史版本，方便随时回滚
+            if (ep + 1) % 50 == 0:
+                history_path = f"{self.learner.check_path.replace('.pt', '')}_epoch_{ep+1}.pt"
+                self.learner.save(ep, best_reward, path=history_path)
+                print(f">>> 💾 Historical Checkpoint Saved: {history_path}")
 
             # --- 早停判断 ---
             if avg_reward > best_reward + min_delta:
                 best_reward = avg_reward
                 early_stop_counter = 0
-                self.learner.save(ep, best_reward)
                 print(f"   >>> 🌟 Best Reward Updated: {best_reward:.4f} (Counter Reset)")
             else:
                 early_stop_counter += 1
@@ -2173,88 +2325,116 @@ class Agent:
 # =========================
 # Entry
 # =========================
+
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
 
-
-    # 构造海量期权组合
-    all_pairs = []
+    # 1. 加载原始数据
     dtype = {
-        'call': str,
-        'put': str,
-        'call_strike': int,
-        'put_strike': int,
-        'call_open': str,
-        'put_open': str,
-        'call_expire': str,
-        'put_expire': str,
+        'call': str, 'put': str,
+        'call_strike': float, 'put_strike': float,
+        'call_open': str, 'call_expire': str,
     }
     df = pd.read_excel('./miniQMT/datasets/all_label_data/20251213_train.xlsx', dtype=dtype)
 
-    # 排除0值太多的, ratio = 0.2
-    exclude_list = ['10007347', '10007466', '10007467', '10006436', '10007346', '10006435', '10007465', '10007726', '10007725', '10007724', '10008052', '10007723', '10006434', '10007722', '10008051', '10007345', '10007721', '10007464', '10007344', '10007988', '10006433', '10006820', '10007720', '10007987', '10006746', '10006745']
-    
-    # 排除0值太多的, ratio = 0.1
-    exclude_list = ['10007347', '10007466', '10007467', '10006436', '10007346', '10006435', '10007465', '10007726', '10007725', '10007724', '10008052', '10007723', '10006434', '10007722', '10008051', '10007345', '10007721', '10007464', '10007344', '10007988', '10006433', '10006820', '10007720', '10007987', '10006746', '10006745', '10007463', '10006432', '10007719']
+    # 排除名单
+    exclude_list = [
+        '10007347', '10007466', '10007467', '10006436', '10007346', '10006435', '10007465', 
+        '10007726', '10007725', '10007724', '10008052', '10007723', '10006434', '10007722', 
+        '10008051', '10007345', '10007721', '10007464', '10007344', '10007988', '10006433', 
+        '10006820', '10007720', '10007987', '10006746', '10006745', '10007463', '10006432', '10007719'
+    ]
+
+    # 2. 动态分类采样逻辑
+    all_pairs = []
+    # 分类桶，目标总数约 20 个
+    buckets = {"ITM": [], "ATM": [], "OTM": []}
+    target_per_bucket = 20
+
+    # 预加载一个账户用于获取初始标的价格
+    temp_account = single_Account(100000, stockList=['510050'])
+
+    # 打乱原始数据顺序，保证采样的随机性
+    # df = df.sample(frac=1).reset_index(drop=True)
+
     for index, row in df.iterrows():
-        start = row['call_open']
-        end = row['call_expire']
-
-        start_time = datetime.strptime(start, "%Y%m%d")
-        end_time = datetime.strptime(end, "%Y%m%d")
-        days = (end_time - start_time).days
-
-        if days <= 40:
-            continue
-
-        call = row['call']
-        put = row['put']
-
-
-        # 排除不合理值太多的(0.8为阈值)
+        call, put = row['call'], row['put']
         if call in exclude_list or put in exclude_list:
             continue
 
-        end_time = end_time - timedelta(days=20)
-        end_time = end_time.strftime('%Y%m%d')
+        # 时间逻辑
+        start_str, expire_str = row['call_open'], row['call_expire']
+        start_dt = datetime.strptime(start_str, "%Y%m%d")
+        expire_dt = datetime.strptime(expire_str, "%Y%m%d")
+        
+        if (expire_dt - start_dt).days <= 40:
+            continue
 
-        start_time = start + '100000'
-        end_time = end_time + '150000'
-        steps = row['steps']
+        # 计算初始 Moneyness (行权价 / 标的价格)
+        # 假设 start_time 为开盘 10:00:00
+        start_time_full = start_str + '100000'
+        try:
+            spot_price = temp_account.getOpenPrice('510050', start_time_full)
+            if spot_price <= 0: continue
+            
+            # 以 Call 的行权价计算
+            moneyness = row['call_strike'] / spot_price
+            
+            # 简单分类：0.98-1.02 为平值，大于 1.05 为虚值，小于 0.95 为实值
+            if 0.97 <= moneyness <= 1.03:
+                cat = "ATM"
+            elif moneyness > 1.03:
+                cat = "OTM"
+            else:
+                cat = "ITM"
+            
+            # 填桶
+            if len(buckets[cat]) < target_per_bucket:
+                end_time_full = (expire_dt - timedelta(days=20)).strftime('%Y%m%d') + '150000'
+                buckets[cat].append({
+                    'call': call, 'put': put,
+                    'start_time': start_time_full,
+                    'end_time': end_time_full,
+                    'steps': int(row['steps']),
+                    'init_moneyness': moneyness
+                })
+        except:
+            continue
+
+        # if sum(len(v) for v in buckets.values()) >= 21:
+        #     break
+
+    # 合并采样结果
+    for cat_list in buckets.values():
+        all_pairs.extend(cat_list)
+    
+    total_steps = sum(p['steps'] for p in all_pairs)
+    print(f"[Info] 采样完成。ITM:{len(buckets['ITM'])}, ATM:{len(buckets['ATM'])}, OTM:{len(buckets['OTM'])}")
+    print(f"[Info] 总组合数: {len(all_pairs)}, 总步数: {total_steps}")
 
 
-        all_pairs.append({
-            'call': call,
-            'put': put,
-            'start_time': start_time,
-            'end_time': end_time,
-            'steps': steps
-        })
-    total_length = 0
-    for dic in all_pairs:
-        total_length += dic['steps']
-
-    option_pairs = all_pairs
-
-    print(f'[Info] Total_steps: {total_length} 👌')
-
+    # 3. 配置 Agent
     cfg = AgentConfig(
-        option_pairs=option_pairs,
-        # pretrained_path="./miniQMT/DL/preTrain/weights/preMOE_best_dummy_data_32_4.pth",
+        option_pairs=all_pairs,
         window_size=32,
         pre_len=4,
         epochs=1000,
-        rollout_T=12288*2.5,
-        num_workers=17,
+        rollout_T=2048 * 8,     # 每次更新采样的基础长度
+        num_workers=12,      # 维持 12 线程
         save_excel=True,
-        mini_batch=2048 * 12,
+        # --- 核心参数调整 ---
+        hidden_dim=256,      # 提升网络宽度以适应复杂逻辑
+        adapter_dim=256,     # 提升特征投影维度
+        mini_batch=2048 * 8, # 保持大 Batch 稳定梯度
+        actor_lr=5e-5,
+        critic_lr=2e-5,
+        check_path='./miniQMT/DL/checkout/check_data_parallel_epoch_100.pt'
     )
 
     agent = Agent(cfg)
 
     try:
-        agent.train_dynamic(from_check_point=False)
+        # 如果你修改了 hidden_dim，建议从 False 开始，因为旧权重形状不匹配
+        agent.train_dynamic(from_check_point=True) 
     finally:
         agent.close()
-    
-

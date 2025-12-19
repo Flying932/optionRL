@@ -44,7 +44,8 @@ def setup_miniqmt_import_root():
             print(f"✅ 成功将项目根目录添加到搜索路径: {miniqmt_root_str}")
         else:
             # 已经添加过，无需重复添加
-            print(f"ℹ️ 项目根目录已在搜索路径中: {miniqmt_root_str}")
+            # print(f"ℹ️ 项目根目录已在搜索路径中: {miniqmt_root_str}")
+            pass
     else:
         print("❌ 错误: 未能在当前路径或其任何父目录中找到 'miniQMT' 文件夹。")
 
@@ -62,8 +63,8 @@ class RealInfo:
             '1m': '1分钟', '5m': '5分钟', '15m': '15分钟', '30m': '30分钟', '60m': '60分钟',
             '1d': '日', 'd': '日', 'day': '日', '日': '日'
         }
-    USECOLS = ['交易时间', '收盘价', '成交量']
-    RENAME  = {'交易时间':'ts','收盘价':'close','成交量':'volume'}
+    USECOLS = ['交易时间', '收盘价', '开盘价', '成交量']
+    RENAME  = {'交易时间':'ts','收盘价':'close','成交量':'volume', '开盘价': 'open'}
 
     def __init__(self,
                  stock_list: List[str],
@@ -147,7 +148,40 @@ class RealInfo:
                     return float(series.iloc[0] if self.date_pick == 'first' else series.iloc[-1])
                 return float(hit.iloc[-1])
             return None
-    
+
+    def get_open_by_str(self, code: str, ts_str: str, period: Optional[str] = None) -> Optional[float]:
+            period = (period or self.period).lower()
+            df = self.get_df(code, period)
+            if df.empty:
+                return None
+
+            dt_min, dt_day = self._parse_keys(ts_str)
+            if self._is_daily_period(period):
+                if dt_day is None: return None
+                if 'ts_date' not in df.columns:
+                    df['ts_date'] = df['ts'].dt.date
+                hit = df.loc[df['ts_date'] == dt_day.date(), 'open']
+                return float(hit.iloc[-1]) if not hit.empty else None
+            else:
+                # 分钟线逻辑与 Close 类似
+                if dt_min is not None:
+                    hit = df.loc[df['ts'] == dt_min, 'open']
+                    if not hit.empty:
+                        return float(hit.iloc[-1])
+                if dt_day is not None:
+                    target_ts = self._pick_bar_time_for_day(period, dt_day, which=self.date_pick)
+                    if target_ts is None: return None
+                    hit = df.loc[df['ts'] == target_ts, 'open']
+                    if hit.empty:
+                        # 容错：如果找不到，取当天的第一条数据
+                        day_mask = (df['ts'].dt.date == dt_day.date())
+                        series = df.loc[day_mask, 'open']
+                        if series.empty: return None
+                        return float(series.iloc[0] if self.date_pick == 'first' else series.iloc[-1])
+                    return float(hit.iloc[-1])
+                return None    
+
+
     def get_avg_volume(self, code: str, period: Optional[str] = None):
         period = (period or self.period).lower()
         df = self.get_df(code, period)
@@ -192,9 +226,12 @@ class RealInfo:
     def _load_excel_minimal(self, code: str, k: str) -> pd.DataFrame:
         path = self._excel_path(code, k)
         if not os.path.exists(path):
-            return pd.DataFrame(columns=['ts','close','volume'])
+            return pd.DataFrame(columns=['ts', 'open', 'close', 'volume'])
 
+        # 注意：这里读取了 USECOLS，包含了 '开盘价'
         df = pd.read_excel(path, sheet_name=0, usecols=self.USECOLS, engine='openpyxl').rename(columns=self.RENAME)
+
+
         if k == '日':
             df['ts'] = pd.to_datetime(df['ts'], format="%Y-%m-%d", errors='coerce')
         else:
@@ -205,9 +242,12 @@ class RealInfo:
                 .drop_duplicates(subset=['ts'], keep='last')
                 .reset_index(drop=True))
 
+        df['open']   = pd.to_numeric(df['open'],   errors='coerce') # 新增
         df['close']  = pd.to_numeric(df['close'],  errors='coerce')
         df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-        return df[['ts','close','volume']]
+        
+        # 返回列包含 open
+        return df[['ts', 'open', 'close', 'volume']]
 
     def _option_put_lru(self, key: Tuple[str, str], df: pd.DataFrame):
         if key in self.option_data_dict:

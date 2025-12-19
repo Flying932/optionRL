@@ -129,7 +129,7 @@ class windowEnv(baseEnv):
                 terminal_bonus -= 0.8 # 回撤惩罚
             
             # 限制 terminal_bonus 绝对值，防止预测过载: 加分最多1.5，但是扣分可以很多
-            terminal_bonus = np.clip(terminal_bonus, -150, 1.5)
+            terminal_bonus = np.clip(terminal_bonus, -5.0, 1.5)
             
             # 最终奖励计算
             final_reward = (step_reward + terminal_bonus)

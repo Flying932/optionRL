@@ -24,7 +24,6 @@ def setup_miniqmt_import_root():
     递归查找 'miniQMT' 文件夹，并将其添加到 sys.path 中，
     从而允许使用 miniQMT 为根的绝对导入。
     """
-    
     # 1. 获取当前脚本的绝对路径
     # stack[0] 是当前正在执行的帧，其 f_globals['__file__'] 是脚本路径
     try:
@@ -163,7 +162,6 @@ class single_Account:
         # 新加的信息
         self.last_action = 0
 
-
     def set_combos(self, call: str, put: str):
         self.comb['call'] = call
         self.comb['put'] = put
@@ -192,7 +190,6 @@ class single_Account:
         return self.hv_cache.get(ts, 0.0)
 
     # ================= 核心算法：向量化 BS & IV 反推 =================
-
     def _bs_price_vectorized(self, S, K, T, r, sigma, op_type, q=0.0):
         """向量化计算理论价格，用于 IV 反推时的误差计算"""
         T = np.maximum(T, 1e-5)
@@ -287,7 +284,6 @@ class single_Account:
         return iv, d, g, t_val, v, rho
 
     # ================= 预加载逻辑 (CPU 救星) =================
-
     def preload_data(self, start_time: str, end_time: str):
         """
         在 reset 阶段一次性计算所有 Greeks。
@@ -381,7 +377,6 @@ class single_Account:
             self.greek_cache[code] = g_cache
 
     # ================= 基础查询 =================
-
     def set_fee(self, fee: float):
         self.fee = float(fee)
 
@@ -1129,9 +1124,6 @@ class single_Account:
         return current_state, self.get_history_state()
     
     def getReward(self, action: int, eps: float=1e-6):
-        """
-        12月20日 优化版：解决 EV 高但不敢做多、市值巨震的问题
-        """
         if len(self.equity_list) <= 1: return 0.0
         
         prev, cur = self.equity_list[-2], self.equity_list[-1]
@@ -1178,40 +1170,6 @@ class single_Account:
         return float(final_reward)
 
 
-    def getReward_1220(self, action: int, eps: float=1e-6):
-        if len(self.equity_list) <= 1: return 0.0
-        
-        prev, cur = self.equity_list[-2], self.equity_list[-1]
-        step_ret = np.log((cur + eps) / (prev + eps))
-        
-        # 1. 基础收益：稍微调低一点点，防止对单步波动过敏
-        final_reward = step_ret * 60.0 
-
-        # 2. 利润保护 (🔥新增)：如果当前已经盈利，回撤的惩罚要加倍
-        # 这样能强制模型在赚到钱后学会“落袋为安”，而不是回吐利润
-        if cur > self.init_capital and step_ret < 0:
-            final_reward += step_ret * 40.0 # 额外的亏损权重
-
-        # 3. 差分回撤惩罚 (保持)
-        peak = self.equity_peak
-        cur_dd = (peak - cur) / (peak + eps)
-        prev_dd = (peak - prev) / (peak + eps)
-        if cur_dd > prev_dd:
-            final_reward -= (cur_dd - prev_dd) * 50.0
-
-        # 4. 交易频率惩罚 (稍微加大，防止频繁平仓刷步数)
-        if action in [1, 2]: 
-            final_reward -= 0.01  # 从 0.005 升到 0.01
-
-        # 5. Reward Clipping (保持 1.5，这是 4090D 训练稳定的关键)
-        final_reward = np.clip(final_reward, -1.5, 1.5)
-            
-        return float(final_reward)
-
-
-
-    
-
     def if_truncated(self) -> bool:
         return (self.equity / self.init_capital) < 0.05
     
@@ -1223,97 +1181,3 @@ class single_Account:
             return True
         return False
 
-    def combine_label_step(self, ts: str, close: float, targetCode: str='510050'):
-        return {}
-    
-# ========================== 用例 ==========================
-if __name__ == '__main__':
-    # 示例：单组合跨式 + 逐步调用step
-    start_time = '20250825100000'
-    # start_time = '20251025100000'
-    # start_time = '20250923143000'
-    end_time = '20250925150000'
-    # end_time = '20251125150000'
-
-    calls, puts = [], []
-
-    call = '10008800'
-    put = '10008809'
-   
-    account = single_Account(100000, fee=1.3, period='30m', stockList=['510050'])
-
-    account.set_combos(call, put)
-    target = '510050'
-
-
-    # dtype = {
-    #     'call': str,
-    #     'put': str,
-    #     'call_strike': int,
-    #     'put_strike': int,
-    #     'call_open': str,
-    #     'put_open': str,
-    #     'call_expire': str,
-    #     'put_expire': str,
-    #     'ignore_days': int,
-    #     'steps': int,
-    # }
-    
-
-    # def calculate_score(row):
-    #     """自定义计算逻辑，输入是一行数据"""
-    #     start = row['call_open']
-    #     end = row['call_expire']
-
-
-    #     start_time = datetime.strptime(start, "%Y%m%d")
-    #     end_time = datetime.strptime(end, "%Y%m%d")
-    #     days = (end_time - start_time).days
-
-    #     call = row['call']
-    
-    #     if days <= 40:
-    #         return 0
-
-    #     end_time = end_time - timedelta(days=20)
-    #     end_time = end_time.strftime('%Y%m%d')
-
-    #     start_time = start + '100000'
-    #     end_time = end_time + '150000'
-        
-    #     return account.get_step_length(call, start_time, end_time)
-
-    # df = pd.read_excel('./miniQMT/datasets/all_label_data/20251213_train.xlsx', dtype=dtype)
-    # df['steps'] = df.apply(calculate_score, axis=1)
-    # df['ignore_days'] = df.apply(lambda row: 20, axis=1)
-    # df['Call_strike'] = df.apply(lambda row: account.option_info_controller.get_strikePrice(row['call']), axis=1)
-    # df['Put_strike'] = df.apply(lambda row: account.option_info_controller.get_strikePrice(row['put']), axis=1)
-
-    # df.to_excel('./miniQMT/datasets/all_label_data/20251213_train.xlsx', index=False)
-    # print(0 / 0)
-
-    # 取样本数据(你的 RealInfo 里方法名可能是 get_bars_between 或 get_bars_between_from_df)
-    try:
-        data = account.real_info_controller.get_bars_between(target, start_time, end_time, '30m')
-    except AttributeError:
-        data = account.real_info_controller.get_bars_between_from_df(target, start_time, end_time, '30m')
-
-    account.preload_data(start_time, end_time)
-    # 初始化一次
-    first_close = float(data.iloc[0].close)
-    first_ts = str(data.iloc[0].ts).replace(' ', '').replace('-', '').replace(':', '')
-    account.init_state(first_ts, first_close)
-
-    for i in range(len(data)):
-        ts = str(data.iloc[i].ts).replace(' ', '').replace('-', '').replace(':', '')
-        close = float(data.iloc[i].close)
-
-        if i == 0:
-            account.step(2, 1, ts, close)
-        elif ts[0: 8] != '20250925':
-            react_state, state, reward, truncated = account.step(0, 0, ts, close)
-
-        
-    # print(0 / 0)
-
-    # account.out_excel()

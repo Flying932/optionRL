@@ -394,6 +394,7 @@ def _set_worker_threads():
     except Exception:
         pass
 
+_set_worker_threads()
 
 # =========================
 # Worker process
@@ -1036,8 +1037,193 @@ class LearnerPPO:
         raw = torch.cat([curr.float(), reduce_call.float(), reduce_put.float()], dim=-1)
         s = self.norm(raw, update=norm_update)
         return raw, s
-
+    
     def update_from_trajs(self, trajs: List[Dict[str, Any]], target_kl: float = 0.015):
+            """
+            针对 4090D 优化的平稳更新版：
+            1. 引入 Explained Variance 监控价值网络质量
+            2. 使用 Huber Loss 处理价值损失，抑制极端惩罚导致的梯度抖动
+            3. 调整 Loss 权重分配：VF=0.5 (增强预判), Ent=0.02 (保持探索)
+            """
+            assert self.actor is not None and self.critic is not None
+            
+            # ---------------------------------------------------------------------
+            # 1. 数据堆叠 (CPU)
+            # ---------------------------------------------------------------------
+            def stack_key(key, dtype):
+                N = len(trajs)
+                if N == 0: return torch.tensor([], dtype=dtype)
+                first_val = trajs[0][key]
+                sample_shape = torch.as_tensor(first_val, dtype=dtype).shape
+                target_shape = list(sample_shape)
+                target_shape.insert(1, N)
+                out = torch.empty(target_shape, dtype=dtype)
+                for i, tr in enumerate(trajs):
+                    out.select(1, i).copy_(torch.as_tensor(tr[key], dtype=dtype))
+                return out
+
+            raw_curr   = stack_key("raw_curr", torch.float32)
+            raw_hist   = stack_key("raw_hist", torch.float32)
+            actions    = stack_key("actions", torch.long)
+            w_idx      = stack_key("w_idx", torch.long)
+            logp_old   = stack_key("logp_old", torch.float32)
+            value_old  = stack_key("value_old", torch.float32)
+            rewards    = stack_key("rewards", torch.float32)
+            done       = stack_key("done", torch.float32)
+            valid      = stack_key("valid", torch.float32)
+            last_value = torch.stack([torch.as_tensor(tr["last_value"], dtype=torch.float32) for tr in trajs], dim=0).squeeze()
+
+            # ---------------------------------------------------------------------
+            # 2. 计算 GAE (CPU)
+            # ---------------------------------------------------------------------
+            T, N = raw_curr.shape[:2]
+            with torch.no_grad():
+                adv = torch.zeros((T, N), dtype=torch.float32)
+                last_gae = torch.zeros((N,), dtype=torch.float32)
+                for t in reversed(range(T)):
+                    m = (1.0 - done[t]) * valid[t]
+                    v_tp1 = last_value if t == T - 1 else value_old[t + 1]
+                    delta = rewards[t] + self.gamma * v_tp1 * m - value_old[t]
+                    last_gae = delta + self.gamma * self.gae_lambda * m * last_gae
+                    adv[t] = last_gae * valid[t]
+                ret = adv + value_old
+
+            # ---------------------------------------------------------------------
+            # 3. Flatten & Filter
+            # ---------------------------------------------------------------------
+            mask_flat = valid.view(-1) > 0.5
+            if not mask_flat.any(): return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+            
+            def flat_and_filter(tensor_in):
+                return tensor_in.flatten(0, 1)[mask_flat]
+
+            curr_flat = flat_and_filter(raw_curr)
+            hist_flat = flat_and_filter(raw_hist)
+            act_flat  = flat_and_filter(actions)
+            widx_flat = flat_and_filter(w_idx)
+            logp_old_flat = flat_and_filter(logp_old)
+            value_old_flat = flat_and_filter(value_old)
+            adv_raw_flat = flat_and_filter(adv)
+            ret_flat  = flat_and_filter(ret)
+
+            # 计算 Explained Variance (衡量旧 Value 对实际 Return 的预测准确度)
+            with torch.no_grad():
+                y_true = ret_flat.numpy()
+                y_pred = value_old_flat.numpy()
+                var_y = np.var(y_true)
+                explained_var = 1.0 - np.var(y_true - y_pred) / (var_y + 1e-8) if var_y > 0 else 0.0
+                explained_var = max(-1.0, float(explained_var)) # 截断异常负值
+
+            # 优势归一化
+            adv_flat = (adv_raw_flat - adv_raw_flat.mean()) / (adv_raw_flat.std() + 1e-8)
+            adv_flat = torch.clamp(adv_flat, -5.0, 5.0)
+
+            # ---------------------------------------------------------------------
+            # 4. PPO Training Loop (Mini-batch)
+            # ---------------------------------------------------------------------
+            M = curr_flat.shape[0]
+            mb = self.update_mb_size
+            stats = {"loss": [], "kl": [], "actor_loss": [], "value_loss": [], "entropy": []}
+            
+            for _ep in range(self.k_epochs):
+                indices = torch.randperm(M)
+                epoch_kl = []
+                for st in range(0, M, mb):
+                    idx = indices[st:st + mb]
+                    if len(idx) == 0: continue
+                    
+                    # 异步推送到 GPU (4090D 优势)
+                    curr_b = curr_flat[idx].to(self.device, non_blocking=True)
+                    hist_b = hist_flat[idx].to(self.device, non_blocking=True)
+                    act_b  = act_flat[idx].to(self.device, non_blocking=True)
+                    widx_b = widx_flat[idx].to(self.device, non_blocking=True)
+                    logp_old_b = logp_old_flat[idx].to(self.device, non_blocking=True)
+                    adv_b  = adv_flat[idx].to(self.device, non_blocking=True)
+                    ret_b  = ret_flat[idx].to(self.device, non_blocking=True)
+                    v_old_b = value_old_flat[idx].to(self.device, non_blocking=True)
+
+                    _, s = self._build_state(curr_b, hist_b, norm_update=False)
+                    logits_a, logits_w = self.actor(s)
+                    
+                    # Actor Logic
+                    dist_a = Categorical(logits=logits_a)
+                    new_logp_a = dist_a.log_prob(act_b)
+                    ent_a = dist_a.entropy().mean()
+
+                    # Weight Logic
+                    need_w = ((act_b == 1) | (act_b == 2) | (act_b == 3)).float()
+                    lw = logits_w.clone()
+                    if need_w.sum() > 0:
+                        maskw = torch.zeros_like(lw, dtype=torch.bool)
+                        maskw[need_w.bool(), 1:] = True
+                        maskw[~need_w.bool(), 0] = True
+                        lw[~maskw] = -1e9
+                    dist_w = Categorical(logits=lw)
+                    new_logp_w = dist_w.log_prob(widx_b)
+                    ent_w = (need_w * dist_w.entropy()).sum() / (need_w.sum() + 1e-6)
+
+                    logp_new = new_logp_a + need_w * new_logp_w
+                    ratio = torch.exp(logp_new - logp_old_b)
+
+                    surr1 = ratio * adv_b
+                    surr2 = torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv_b
+                    actor_loss = -torch.min(surr1, surr2).mean()
+
+                    # --- 🔥 关键改进：Huber Loss + Value Clipping ---
+                    v_pred = self.critic(s).squeeze(-1)
+                    # 使用 Huber Loss 代替 MSE，缓解 -150 等极端值冲击
+                    v_loss_unclipped = F.smooth_l1_loss(v_pred, ret_b)
+                    
+                    v_pred_clipped = v_old_b + torch.clamp(v_pred - v_old_b, -self.clip_eps, self.clip_eps)
+                    v_loss_clipped = F.smooth_l1_loss(v_pred_clipped, ret_b)
+                    value_loss = torch.max(v_loss_unclipped, v_loss_clipped)
+
+                    entropy = ent_a + 0.5 * ent_w
+                    
+                    # --- 🔥 总 Loss 计算 (VF权重提升至0.5) ---
+                    # 增强价值网络学习力度，使其能真正感知到 -150 的代价
+                    loss = actor_loss + 0.5 * value_loss - 0.05 * entropy
+                    
+                    self.opt_adapter.zero_grad(set_to_none=True)
+                    self.opt_actor.zero_grad(set_to_none=True)
+                    self.opt_critic.zero_grad(set_to_none=True)
+                    loss.backward()
+                    
+                    # 梯度裁剪
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(self.adapter.parameters(), 0.5)
+                    
+                    self.opt_adapter.step()
+                    self.opt_actor.step()
+                    self.opt_critic.step()
+                    
+                    with torch.no_grad():
+                        kl_b = (logp_old_b - logp_new).mean().abs().item()
+                        epoch_kl.append(kl_b)
+                        stats["loss"].append(loss.item())
+                        stats["kl"].append(kl_b)
+                        stats["actor_loss"].append(actor_loss.item())
+                        stats["value_loss"].append(value_loss.item())
+                        stats["entropy"].append(entropy.item())
+
+                if (sum(epoch_kl)/len(epoch_kl)) > 1.5 * target_kl: break
+
+            # 5. 更新状态归一化
+            if M > 0:
+                with torch.no_grad():
+                    for st in range(0, M, mb):
+                        self._build_state(curr_flat[st:st+mb].to(self.device), hist_flat[st:st+mb].to(self.device), norm_update=True)
+
+            self.scheduler_actor.step()
+            self.scheduler_critic.step()
+            self.scheduler_adapter.step()
+            
+            def get_avg(k): return sum(stats[k]) / len(stats[k]) if stats[k] else 0.0
+            return get_avg("loss"), get_avg("kl"), get_avg("actor_loss"), get_avg("value_loss"), get_avg("entropy"), explained_var
+
+
+    def oldold_update_from_trajs(self, trajs: List[Dict[str, Any]], target_kl: float = 0.015):
         """
         针对 110 Epoch 后的异常修正版：
         1. 使用 Huber Loss 替换 MSE，平滑异常收益冲击
@@ -1170,7 +1356,7 @@ class LearnerPPO:
                 entropy = ent_a + 0.5 * ent_w
                 
                 # --- 🔥 总 Loss 计算 (进一步调低 VF 权重) ---
-                loss = actor_loss + 0.01 * value_loss - 0.02 * entropy
+                loss = actor_loss + 0.5 * value_loss - 0.02 * entropy
                 
                 self.opt_adapter.zero_grad(set_to_none=True)
                 self.opt_actor.zero_grad(set_to_none=True)
@@ -1827,8 +2013,6 @@ class Agent:
         print(f"[Info] Warmup done. Norm counts: {self.learner.norm.running_ms.n}")
 
 
-
-
     def train_dynamic(self, from_check_point: bool = False):
         if from_check_point:
             sys.stdout = outPut("./miniQMT/DL/results/PPO_records.txt", mode='a')
@@ -2205,8 +2389,12 @@ class Agent:
                         ])
             print("[Info] Scaled reward mean/std/min/max:", rs.mean(), rs.std(), rs.min(), rs.max())
 
-            loss, kl, a_loss, v_loss, ent = self.learner.update_from_trajs(trajs_for_update)
+            loss, kl, a_loss, v_loss, ent, ev = self.learner.update_from_trajs(trajs_for_update)
+            # loss, kl, a_loss, v_loss, ent = self.learner.update_from_trajs(trajs_for_update)
 
+            if 'ev' not in self.records: self.records['ev'] = []
+            self.records['ev'].append(float(ev))
+            
             # -------------------------
             # 5) 写 records + 打印 + 早停
             # -------------------------
@@ -2263,7 +2451,7 @@ class Agent:
                 f"[Epoch {ep+1} / {self.cfg.epochs}] "
                 f"sampled_group_steps={sampled_steps_sum} target={rollout_T_big} | "
                 f"valid_steps={total_valid_steps} | "
-                f"Reward:{avg_reward:.6f} | Market_value:{avg_equity:.2f} \n"
+                f"Reward:{avg_reward:.6f} | EV:{ev:.4f} | Market_value:{avg_equity:.2f} \n"
                 f"Sharpe Ratio -> Mean: {sr_mean:.4f} | Max: {sr_max:.4f} | Min: {sr_min:.4f} | "
                 f"Sharpe Ratio Percent(1.0~2.0) -> Ratio: {sp_cnt:.4f}\n"
                 f"loss={loss:.4f} kl={kl:.4f} | "
@@ -2418,17 +2606,17 @@ if __name__ == "__main__":
         option_pairs=all_pairs,
         window_size=32,
         pre_len=4,
-        epochs=1000,
+        epochs=1500,
         rollout_T=2048 * 8,     # 每次更新采样的基础长度
-        num_workers=12,      # 维持 12 线程
+        num_workers=14,      # 维持 12 线程
         save_excel=True,
         # --- 核心参数调整 ---
         hidden_dim=256,      # 提升网络宽度以适应复杂逻辑
         adapter_dim=256,     # 提升特征投影维度
-        mini_batch=2048 * 8, # 保持大 Batch 稳定梯度
-        actor_lr=5e-5,
-        critic_lr=2e-5,
-        check_path='./miniQMT/DL/checkout/check_data_parallel_epoch_100.pt'
+        mini_batch=2048 * 16, # 保持大 Batch 稳定梯度
+        actor_lr=1e-4,
+        critic_lr=3e-4,
+        check_path='./miniQMT/DL/checkout/check_data_parallel.pt'
     )
 
     agent = Agent(cfg)

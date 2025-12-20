@@ -9,7 +9,6 @@
     3. 修复了 __init__ 和 reset 重复加载数据的性能 BUG。
     4. [新增] 配合 single_Account 极速版，调用 preload_data 预热缓存。
 """
-
 from abc import ABC, abstractmethod
 from finTool.single_window_account_fast import single_Account
 import numpy as np
@@ -83,7 +82,19 @@ class windowEnv(baseEnv):
         current_state = torch.tensor(current_state, dtype=torch.float32)
         history_state = torch.tensor(history_state, dtype=torch.float32)
         return current_state.shape, history_state.shape
-    
+    def get_smooth_reward(self, raw_terminal_bonus):
+        """
+        将 -150 到 1.5 的极端奖励映射到神经网络易于消化的 [-5.0, 1.5]
+        """
+        if raw_terminal_bonus >= 0:
+            # 正奖励保持不变或轻微平滑
+            return np.clip(raw_terminal_bonus, 0, 1.5)
+        else:
+            # 负惩罚使用 tanh 平滑：当原始值是 -150 时，输出约为 -5.0
+            # 这里的 30 是缩放因子，你可以根据需要微调
+            return -5.0 * np.tanh(np.abs(raw_terminal_bonus) / 30.0)
+
+
     def step(self, action, weight, test: bool=False) -> tuple:
         # 1. 越界保护
         if self.row_index >= self.total_length:
@@ -102,35 +113,35 @@ class windowEnv(baseEnv):
             final_action = 3 if self.account_controller.has_positions() else action
             curr, hist, step_reward, truncated = self.account_controller.step(final_action, weight, ts, close)
             
-            # --- 终端奖励建模 (针对 110 Epoch 后的逻辑重构) ---
             peak = self.account_controller.equity_peak
             current = self.account_controller.equity
             dd = max(0, (peak - current) / (peak + 1e-6))
-            sr = self.account_controller.get_sharpe_ratio() # 获取全过程夏普
+            sr = self.account_controller.get_sharpe_ratio() 
             
             terminal_bonus = 0.0
-
-            # A. 二次方夏普奖惩：核心约束
+            
+            # --- 终端奖励建模 1220 优化版 ---
             if sr > 2.5:
-                # 只要 SR > 3.0，惩罚随偏离度平方剧增，彻底封死刷分路径
-                terminal_bonus -= ((sr - 2.5) ** 2) * 10
+                # 🔥 强化版：如果 SR 进入红色赌博区，惩罚系数从 5/10 提升至 30
+                # 强制模型为了躲避重罚而选择更稳健的持仓
+                terminal_bonus -= ((sr - 2.5) ** 2) * 30 
             elif 1.0 <= sr <= 2.5:
-                # 鼓励模型停留在黄金区间
-                terminal_bonus += 0.8  
+                # 强化诱导：加大黄金区间的正向诱导
+                terminal_bonus += 1.5 
             elif sr < 0.5:
-                # 低夏普惩罚
                 terminal_bonus -= 0.5
 
-            # B. 破产与大回撤硬约束 (保持低量级，不冲击 Value 网络)
-            if current < self.account_controller.init_capital * 0.7:
-                terminal_bonus -= 1.0 # 破产惩罚
+            # B. 破产与回撤硬约束 (提前触发，增加敬畏感)
+            if current < self.account_controller.init_capital * 0.8: 
+                terminal_bonus -= 2.0 
             
-            if dd > 0.20:
-                terminal_bonus -= 0.8 # 回撤惩罚
+            # 回撤惩罚门槛从 0.15 降到 0.08，实现更细腻的净值保护
+            if dd > 0.08: 
+                terminal_bonus -= 1.0 
             
-            # 限制 terminal_bonus 绝对值，防止预测过载: 加分最多1.5，但是扣分可以很多
-            terminal_bonus = np.clip(terminal_bonus, -5.0, 1.5)
-            
+            # C. 截断与平滑 (保持)
+            terminal_bonus = np.clip(terminal_bonus, -150.0, 1.5)
+            terminal_bonus = self.get_smooth_reward(terminal_bonus)
             # 最终奖励计算
             final_reward = (step_reward + terminal_bonus)
             
@@ -145,72 +156,6 @@ class windowEnv(baseEnv):
         current_state, history_state, reward, truncated = self.account_controller.step(action, weight, ts, close)
         self.reward_list.append(reward)
         return current_state, history_state, reward, False, truncated
-
-
-    # def step(self, action, weight, test: bool=False) -> tuple:
-    #     # 1. 越界保护
-    #     if self.row_index >= self.total_length:
-    #         curr, hist = self.account_controller.get_total_state()
-    #         return curr, hist, 0.0, True, True
-        
-    #     ts = self.ts_arr[self.row_index]
-    #     close = self.close_arr[self.row_index]
-    #     self.row_index += 1
-
-    #     # 2. 判断是否是最后一步
-    #     is_terminal = (self.row_index >= min(self.total_length, self.timesteps))
-
-    #     if is_terminal:
-    #         # --- 关键：最后一步强制平仓结算 ---
-    #         final_action = 3 if self.account_controller.has_positions() else action
-    #         curr, hist, step_reward, truncated = self.account_controller.step(final_action, weight, ts, close)
-            
-    #         # --- 终端奖励建模 ---
-    #         peak = self.account_controller.equity_peak
-    #         current = self.account_controller.equity
-    #         dd = max(0, (peak - current) / (peak + 1e-6))
-            
-    #         # 获取本次采样全过程的夏普比率
-    #         sr = self.account_controller.get_sharpe_ratio()
-            
-    #         terminal_bonus = 0.0
-
-    #         # A. 夏普比率区间奖惩 (已缩减)
-    #         if sr > 3.0:
-    #             terminal_bonus -= (sr - 2.0) * 0.5 # 进一步平滑
-    #         elif 1.0 <= sr <= 2.5:
-    #             terminal_bonus += 0.5 
-    #         elif sr < 0.5:
-    #             terminal_bonus -= 0.3
-
-    #         # B. 破产惩罚 (大幅削减，从 -5.0 降至 -1.0)
-    #         if current < self.account_controller.init_capital * 0.7:
-    #             terminal_bonus -= 1.0
-            
-    #         # C. 回撤惩罚 (大幅削减，从 -4.0 降至 -0.8)
-    #         if dd > 0.20:
-    #             terminal_bonus -= 0.8
-    #         elif dd < 0.05 and current > self.account_controller.init_capital * 1.05:
-    #             terminal_bonus += 0.4 
-
-    #         if terminal_bonus < -1:
-    #             terminal_bonus = -1
-    #         elif terminal_bonus > 1:
-    #             terminal_bonus = 1
-
-    #         final_reward = (step_reward + terminal_bonus)
-            
-    #         # 打印一下，方便在日志里观察终端奖惩情况
-    #         # if not test:
-    #         #     print(f"  [Terminal] SR: {sr:.2f} | Bonus: {terminal_bonus:.2f} | Final_Reward: {final_reward:.4f}")
-    #         sum_reward = sum(self.reward_list)
-    #         # print(f"[Info] 奖励之和: {sum_reward} | 终端奖励: {final_reward} | 奖励均值: {sum_reward / len(self.reward_list)}")
-    #         return curr, hist, final_reward, True, truncated
-
-    #     # 3. 正常中间步骤
-    #     current_state, history_state, reward, truncated = self.account_controller.step(action, weight, ts, close)
-    #     self.reward_list.append(reward)
-    #     return current_state, history_state, reward, False, truncated
 
 
 

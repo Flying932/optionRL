@@ -5,6 +5,8 @@
     1. 包含向量化牛顿法 (Vectorized Newton-Raphson) 反推 IV。
     2. 包含向量化 Black-Scholes 计算 Greeks。
     3. preload_data 预计算所有数据，消除训练时的 CPU 计算压力。
+
+    更新时间2025-12-20, 本框架需要对接finRL
 """
 from dataclasses import asdict, dataclass, field
 from typing import ClassVar, Dict, Tuple, List, Optional
@@ -24,30 +26,21 @@ def setup_miniqmt_import_root():
     递归查找 'miniQMT' 文件夹，并将其添加到 sys.path 中，
     从而允许使用 miniQMT 为根的绝对导入。
     """
-    
-    # 1. 获取当前脚本的绝对路径
-    # stack[0] 是当前正在执行的帧，其 f_globals['__file__'] 是脚本路径
     try:
-        # 获取调用此函数的脚本的路径
+
         calling_script_path = Path(sys._getframe(1).f_globals['__file__']).resolve()
     except KeyError:
-        # 如果在交互式环境或某些特殊环境中，可能无法获取文件路径，则退出
+
         print("⚠️ 警告: 无法确定当前脚本路径，跳过路径设置。")
         return
     
     current_path = calling_script_path
     miniqmt_root = None
-    
-    # 2. 向上递归查找
-    # current_path.parents 是一个包含所有父目录的序列
     for parent in [current_path] + list(current_path.parents):
         if parent.name == 'miniQMT':
             miniqmt_root = parent
             break
-        
-    # 3. 检查并添加路径
     if miniqmt_root:
-        # 将找到的 miniQMT 目录添加到 sys.path
         miniqmt_root_str = str(miniqmt_root)
         if miniqmt_root_str not in sys.path:
             sys.path.insert(0, miniqmt_root_str)
@@ -58,12 +51,9 @@ def setup_miniqmt_import_root():
             pass
     else:
         print("❌ 错误: 未能在当前路径或其任何父目录中找到 'miniQMT' 文件夹。")
-
 setup_miniqmt_import_root()
-
 from DL.finTool.optionBaseInfo import optionBaseInfo
 from DL.finTool.realInfo import RealInfo
-
 
 # ========================== 数据结构 ==========================
 @dataclass(slots=True)
@@ -92,36 +82,77 @@ class Trade:
     success_volume: int
 
 # ========================== 账户类 ==========================
-class single_Account:
-    def __init__(self, init_capital: float, fee: float = 1.3, period: str = '30m',
-                 stockList: Optional[List[str]] = None, filepath: str = './miniQMT/datasets/',
-                 window: int=32):
-        self.init_capital = float(init_capital)
+class tradeEngine:
+    def __init__(self, 
+                 init_capital: float,
+                 fee: float=1.3,
+                 period: str='30m',
+                 stockList=None,
+                 filepath: str='./miniQMT/datasets/',
+                 window: int=32,
+                 start_time: str='',
+                 end_time: str='',
+                ):
+        self.init_capital = init_capital
         self.filepath = filepath
-        self.fee = float(fee)
+        self.fee = fee
         self.period = period if period else '30m'
-        self.stockList = stockList if stockList else ['510050', '588000']
+        self.stockList = stockList if stockList else ['510050']
+        self.window_size = window if window else 32
 
-        self.free_money = float(init_capital)
-        self.frozen_money = 0.0
-        self.equity = float(init_capital)
-        self.positions: Dict[str, Tuple[str, int, float]] = {}
-
-        self.Trades: List[Trade] = []
-        self.Orders: List[Order] = []
-        self.has_disposed_id = -1
-
+        # 获取数据的两个类
         self.option_info_controller = optionBaseInfo(self.stockList, f'{filepath}/optionInfo')
         self.real_info_controller = RealInfo(self.stockList, f'{filepath}/realInfo',
                                              period, max_option_cache=15, date_pick='last')
 
-        self.equity_list: List[float] = [self.init_capital]
-        self.time_list: List[str] = []
-        self.frozen_money_list: List[float] = [self.frozen_money]
-        self.free_money_list: List[float] = [self.free_money]
-        self.target_gain_list = []
+        # 初始化所有变量
+        self.free_money = self.init_capital
+        self.frozen_money = 0
+        self.equity = self.init_capital
+        self.equity_peak = self.equity
 
-        # 初始化 comb 避免 NoneType 报错
+        # ('买入开仓', abs(signed), new_value)
+        self.positions = {}
+        self.Trades: List[Trade] = {}
+        self.Orders: List[Order] = {}
+        self.has_disposed_id = -1
+
+        self.equity_list = [self.equity]
+        self.frozen_money_list = [self.frozen_money]
+        self.free_money_list = [self.free_money]
+        self.target_gain_list = [0]
+        self.target_price = 0.0
+        self.raw_returns = []
+        
+        # ppo
+        self.last_action = 0
+
+        # 初始化变量信息
+        self.reset(start_time, end_time, self.stockList[0])
+
+
+    # 对交易引擎初始化
+    def reset(self, start_time: str, end_time: str, targetCode: str='510050'):
+        self.free_money = self.init_capital
+        self.frozen_money = 0
+        self.equity = self.init_capital
+        self.equity_peak = self.equity
+
+        # ('买入开仓', abs(signed), new_value)
+        self.positions = {}
+        self.Trades: List[Trade] = {}
+        self.Orders: List[Order] = {}
+        self.has_disposed_id = -1
+
+        self.equity_list = [self.equity]
+        self.frozen_money_list = [self.frozen_money]
+        self.free_money_list = [self.free_money]
+        self.target_gain_list = [0]
+        self.target_price = 0.0
+
+        self.raw_returns = []
+
+        # 期权状态信息
         self.comb = {
             'call': None, 'put': None,
             'call_price': 0.0, 'put_price': 0.0,
@@ -137,19 +168,14 @@ class single_Account:
             'call_real_value': 0.0, 'put_real_value': 0.0,
             'call_time_value': 0.0, 'put_time_value': 0.0,
             'call_hv_160': 0.0, 'put_hv_160': 0.0,
-        }   
+        }  
 
-        self.target_price: float = 0.0
-        self.equity_peak = float(init_capital)
+        # 账户状态信息
         self.cash_ratio = 1.0
-        self.margin_ratio = 0.0
-        self.target_gain = 0.0
-        self.prev_equity = float(init_capital)
-        self.eps = 1e-6
-        self.info = {"message": "initial"}
+        self.margin_ratio = 0.0 
 
-        self.window_size = window
-        self.h_states = deque(maxlen=window)
+        self.eps = 1e-6
+        self.h_states = deque(maxlen=self.window_size)
 
         # 缓存池
         self.hv_cache = {} 
@@ -160,14 +186,21 @@ class single_Account:
         self.open_cache = {}  # 【新增】存 Open
         self.raw_returns = []  # 记录真实的单步收益率（不带任何 penalty）
 
-        # 新加的信息
+        # ppo
         self.last_action = 0
 
+        # 调用缓存加载hv160
+        self.init_hv160(start_time, end_time)
 
+        # 预加载期权greeks
+        self.preload_data(start_time, end_time)
+
+    # 设置期权组合
     def set_combos(self, call: str, put: str):
         self.comb['call'] = call
         self.comb['put'] = put
-
+    
+    # hv160的缓存, 需要根据时间进行加载, 需要调用来初始化
     def init_hv160(self, start_time: str, end_time: str, targetCode: str='510050'):
         """计算历史波动率 (作为 IV 反推失败时的兜底)"""
         try:
@@ -192,7 +225,6 @@ class single_Account:
         return self.hv_cache.get(ts, 0.0)
 
     # ================= 核心算法：向量化 BS & IV 反推 =================
-
     def _bs_price_vectorized(self, S, K, T, r, sigma, op_type, q=0.0):
         """向量化计算理论价格，用于 IV 反推时的误差计算"""
         T = np.maximum(T, 1e-5)
@@ -286,15 +318,14 @@ class single_Account:
         d, g, t_val, v, rho = self._bs_greeks_vectorized(S, K, T, r, iv, op_type, q)
         return iv, d, g, t_val, v, rho
 
-    # ================= 预加载逻辑 (CPU 救星) =================
-
+    # ================= 预加载Greeks =================
     def preload_data(self, start_time: str, end_time: str):
         """
         在 reset 阶段一次性计算所有 Greeks。
         解决 CPU 100% 的关键函数。
         """
         codes = [self.comb['call'], self.comb['put']]
-        target_code = '510050'
+        target_code = self.stockList[0]
         
         # 1. 加载标的数据
         try:
@@ -380,8 +411,8 @@ class single_Account:
             
             self.greek_cache[code] = g_cache
 
-    # ================= 基础查询 =================
 
+    # ================= 基础查询函数 =================
     def set_fee(self, fee: float):
         self.fee = float(fee)
 
@@ -425,11 +456,12 @@ class single_Account:
             margin = 0.0
         return float(margin)
 
-    # ================= 交易逻辑 (保持原样) =================
 
+# ================= 交易逻辑 =================
     def get_option_list(self, stockCode: str = '510050', expire: str = '202512', op_type: str = 'call'):
         return self.option_info_controller.find_options_by_stock_and_expiry(stockCode, expire, op_type)
 
+    # 提交委托
     def submit_order(self, code: str, direction: str, volume: int, time_str: str,
                      price: float = None, c_id: int = -1):
         if len(code) == 8:
@@ -442,6 +474,7 @@ class single_Account:
         order = Order(code, direction, int(volume), 0, time_str, '已报', '', int(c_id))
         self.Orders.append(order)
 
+    # 计算可买开跨式期权的张数
     def _pair_qty_buy_open(self, ts: str, desired: int, call: str, put: str,
                            c_id: int, free_override: Optional[float] = None) -> int:
         price_c = self.getClosePrice(call, ts)
@@ -455,6 +488,7 @@ class single_Account:
         vol_cap = min(self.getRealVolume(call, ts), self.getRealVolume(put, ts))
         return max(0, min(int(desired), cap_cash, vol_cap))
 
+    # 计算可卖开跨式期权的张数
     def _pair_qty_sell_open(self, ts: str, desired: int, call: str, put: str,
                             c_id: int, free_override: Optional[float] = None) -> int:
         m_c = self.getMargin(call)
@@ -466,23 +500,29 @@ class single_Account:
         vol_cap = min(self.getRealVolume(call, ts), self.getRealVolume(put, ts))
         return max(0, min(int(desired), cap_cash, vol_cap))
 
+    # 买开
     def open_long_pair(self, desired: int, ts: str, call: str, put: str, c_id: int=-1) -> int:
         q = self._pair_qty_buy_open(ts, desired, call, put, c_id)
-        if q <= 0: return 0
+        if q <= 0: 
+            return 0
         self.submit_order(call, '买入开仓', q, ts, c_id=c_id)
         self.submit_order(put,  '买入开仓', q, ts, c_id=c_id)
         return q
 
+    # 卖开
     def open_short_pair(self, desired: int, ts: str, call: str, put: str, c_id: int=-1) -> int:
         q = self._pair_qty_sell_open(ts, desired, call, put, c_id)
-        if q <= 0: return 0
+        if q <= 0: 
+            return 0
         self.submit_order(call, '卖出开仓', q, ts, c_id=c_id)
         self.submit_order(put,  '卖出开仓', q, ts, c_id=c_id)
         return q
 
+    # 平仓
     def close_pair(self, ts: str, call: str, put: str, w: float = None, c_id: int=-1) -> None:
         w = 1.0 if (w is None) else float(w)
-        if w <= 0: return
+        if w <= 0: 
+            return
         for code in (call, put):
             pos = self.positions.get(code)
             if not pos: continue
@@ -497,6 +537,7 @@ class single_Account:
             elif d == '买入开仓':
                 self.submit_order(code, '卖出平仓', v_to_close, ts, c_id=c_id)
 
+    # 空头变多头, target是总减少的组合数
     def flip_short_to_long(self, target: int, ts: str, call: str, put: str, c_id: int=-1) -> None:
         pos_dir, pos_size = self.get_pair_position(call, put)
         v = min(target, pos_size) if pos_dir < 0 else 0
@@ -507,6 +548,7 @@ class single_Account:
         if l > 0:
             self.open_long_pair(l, ts, call, put, c_id)
 
+    # 多头变空头
     def flip_long_to_short(self, target: int, ts: str, call: str, put: str, c_id: int=-1) -> None:
         pos_dir, pos_size = self.get_pair_position(call, put)
         v = min(target, pos_size) if pos_dir > 0 else 0
@@ -517,6 +559,7 @@ class single_Account:
         if l > 0:
             self.open_short_pair(l, ts, call, put, c_id)
 
+    # 获取持仓的方向和仓位
     def get_pair_position(self, call: str, put: str) -> Tuple[int, int]:
         d1, v1 = self.positions.get(call, (None, 0, 0.0))[0:2]
         d2, v2 = self.positions.get(put,  (None, 0, 0.0))[0:2]
@@ -525,6 +568,7 @@ class single_Account:
         if d1 == d2 == '卖出开仓': return -1, min(v1, v2)
         return 0, 0
 
+    # 撮合成交
     def dispose_order(self, code: str, dispose_volume: int, price: float,
                       free_money_delta: float, frozen_money_delta: float):
         if code in self.positions:
@@ -549,12 +593,7 @@ class single_Account:
         self.frozen_money += float(frozen_money_delta)
         self.free_money += float(free_money_delta)
 
-    def _update_position_values(self, time_str: str):
-        for code, (direction, volume, _) in list(self.positions.items()):
-            price = self.getClosePrice(code, time_str)
-            mul = self.option_info_controller.get_multiplier(code)
-            self.positions[code] = (direction, volume, price * volume * mul)
-
+    # 根据当前的持仓市值更新账户持仓数量、总市值(浮动盈亏)
     def _update_comb_equity(self):
         """
         仅负责更新：当前净值、持仓组合状态、资金利用率。
@@ -562,29 +601,7 @@ class single_Account:
         """
         total_value = 0.0
         # 1. 计算持仓市值
-        for code, (direction, volume, value) in self.positions.items():
-            # 买入开仓 value 为正，卖出开仓 value 为负 (在 equity 计算中)
-            # 但注意：optionBaseInfo 里的 value 通常是 (Price * Vol * Mul)，是正数
-            # 你的 dispose_order 里存的 value 是正数
-            
-            # 修正逻辑：
-            # 如果是 Long，市值是 +Value
-            # 如果是 Short，市值是 -Value (因为是负债)
-            # 但通常 equity = Cash + Value(Long) - Value(Short)
-            
-            # 你的 dispose_order 里：
-            # Long: free -cost, value = +cost
-            # Short: free +price, value = +price
-            # 所以 Equity = free + frozen + (Long_Value - Short_Value) ??
-            # 不，你的逻辑里：
-            # Long: free 减少，Position 有价值。
-            # Short: free 增加(卖得钱)，frozen 增加(保证金)，Position 是负债。
-            
-            # 让我们沿用你原代码的逻辑：
-            # signed_val = value if direction == '买入开仓' else -value
-            # 这通常是对的，但在期权卖方里，卖出的钱已经进了 free_money。
-            # 卖方持仓的“市值”是此时平仓需要花的钱（负值）。
-            
+        for code, (direction, volume, value) in self.positions.items():  
             if direction == '买入开仓':
                 total_value += value
             elif direction == '卖出开仓':
@@ -605,42 +622,54 @@ class single_Account:
         self.margin_ratio = self.frozen_money / denom
         self.equity_peak = max(self.equity_peak, self.equity)
 
-    def update_positions(self, time_str: str):
-        # 根据最新价格更新持仓市值
+
+    # 根据最新价格更新持仓市值, 到期的强制清算, 没到期的根据市值更新
+    def update_positions(self, time_str: str, use_open: bool=False):
         delete_list = []
         for code, (direction, volume, _) in list(self.positions.items()):
-            if len(code) != 8: continue
+            if len(code) != 8: 
+                continue
+
             expire = self.option_info_controller.get_expireDate(code)
-            if expire > time_str[0:8]: continue
 
-            price = self.getClosePrice(code, time_str)
-            mul = self.option_info_controller.get_multiplier(code)
-            margin = self.getMargin(code)
-            c_id = -1
+            # 到期的期权强制清算
+            if expire <= time_str[0: 8]: 
+                price = self.getClosePrice(code, time_str)
+                mul = self.option_info_controller.get_multiplier(code)
+                margin = self.getMargin(code)
+                c_id = -1
 
-            if direction == '买入开仓':
-                order = Order(code, '卖出平仓', volume, volume, time_str, '成交', '强制卖出平仓', c_id)
-                self.Orders.append(order)
-                trade = Trade(order.order_id, code, '卖出平仓', price * volume * mul, 0.0, time_str, volume)
-                self.Trades.append(trade)
-                free_delta = price * volume * mul
-                self.dispose_order(code, -volume, price, free_delta, 0.0)
+                if direction == '买入开仓':
+                    order = Order(code, '卖出平仓', volume, volume, time_str, '成交', '强制卖出平仓', c_id)
+                    self.Orders.append(order)
+                    trade = Trade(order.order_id, code, '卖出平仓', price * volume * mul, 0.0, time_str, volume)
+                    self.Trades.append(trade)
+                    free_delta = price * volume * mul
+                    self.dispose_order(code, -volume, price, free_delta, 0.0)
+                else:
+                    fee = self.fee * volume
+                    order = Order(code, '买入平仓', volume, volume, time_str, '成交', '强制买入平仓', c_id)
+                    self.Orders.append(order)
+                    trade = Trade(order.order_id, code, '买入平仓', price * volume * mul, fee, time_str, volume)
+                    self.Trades.append(trade)
+                    frozen_delta = -margin * volume
+                    free_delta = margin * volume - price * volume * mul - fee
+                    self.dispose_order(code, +volume, price, free_delta, frozen_delta)
+                delete_list.append(code)
+            
             else:
-                fee = self.fee * volume
-                order = Order(code, '买入平仓', volume, volume, time_str, '成交', '强制买入平仓', c_id)
-                self.Orders.append(order)
-                trade = Trade(order.order_id, code, '买入平仓', price * volume * mul, fee, time_str, volume)
-                self.Trades.append(trade)
-                frozen_delta = -margin * volume
-                free_delta = margin * volume - price * volume * mul - fee
-                self.dispose_order(code, +volume, price, free_delta, frozen_delta)
-
-            delete_list.append(code)
+                # 未到期的更新其市值
+                if use_open:
+                    price = self.getOpenPrice(code, time_str)
+                else:
+                    price = self.getClosePrice(code, time_str)
+                mul = self.option_info_controller.get_multiplier(code)
+                self.positions[code] = (direction, volume, price * volume * mul)
 
         for code in delete_list:
             self.positions.pop(code, None)
 
-        self._update_position_values(time_str)
+
         self.frozen_money = 0 if abs(self.frozen_money) < self.eps else self.frozen_money
         self.free_money = 0 if abs(self.free_money) < self.eps else self.free_money
         self.frozen_money_list.append(self.frozen_money)
@@ -821,7 +850,6 @@ class single_Account:
 
             real_volume = self.getRealVolume(code, time_str)
     
-
             # 【核心修改】：根据参数决定用 Open 还是 Close
             if use_open_price:
                 price = self.getOpenPrice(code, time_str)
@@ -898,111 +926,14 @@ class single_Account:
                 order.info = '目前暂不交易股票'
 
 
-    def out_excel(self):
-        if len(self.time_list) <= 0: return
-        filepath = f'{self.filepath}/outs/account_info.xlsx'
-        peak = 0.0
-        for i, eq in enumerate(self.equity_list):
-            peak = max(peak, eq)
-            if i == 0:
-                self.gain_rate.append((eq - self.init_capital) / self.init_capital)
-                self.draw_down.append(0.0)
-            else:
-                prev = self.equity_list[i - 1]
-                self.gain_rate.append((eq - prev) / (prev if prev != 0 else 1.0))
-                self.draw_down.append((peak - eq) / (peak if peak != 0 else 1.0))
+    # ================= 状态相关 =================
+    def if_truncated(self) -> bool:
+        return (self.equity / self.init_capital) < 0.05
 
-        df = pd.DataFrame({'时间': self.time_list, '市值': self.equity_list, '收益率': self.gain_rate, '回撤': self.draw_down})
-        df.to_excel(filepath, sheet_name='账户信息', index=False)
-        
-        if self.Orders:
-            filepath = f'{self.filepath}/outs/order_list.xlsx'
-            df = pd.DataFrame([asdict(o) for o in self.Orders])
-            df.to_excel(filepath, sheet_name='委托记录', index=False)
-
-        if self.Trades:
-            filepath = f'{self.filepath}/outs/trade_list.xlsx'
-            df = pd.DataFrame([asdict(t) for t in self.Trades])
-            df.to_excel(filepath, sheet_name='交易记录', index=False)
-        
-    def get_step_length(self, code: str, start_time: str, end_time: str):
-
-        df = self.real_info_controller.get_bars_between(code, start_time, end_time)
-        return len(df)
-
-    # ================= 强化学习接口 =================
-    def step(self, action, weight, ts, close):
-        """
-        【Next-Open 模式 + 原版 getReward】
-        逻辑链条：
-        1. 开盘：执行 T-1 的 Action，扣除手续费。
-        2. 收盘：观察 T 的行情。
-        3. 结算：计算 T-1 到 T 的总盈亏 (含 a_{t-1} 成本) 给 getReward。
-        4. 决策：提交 T 的 Action，留待 T+1 执行。
-        """
-        # 1. 记录 T-1 结束时的净值 (来自上一步的 equity_list 最后一位)
-        prev_equity = self.equity_list[-1] if self.equity_list else self.init_capital
-
-        # 2. 执行 T-1 提交的 Pending Orders (以当前 T 的 Open 价成交)
-        # 这步执行完后，账户的 free_money, positions 会更新
-        self.simulate_fill(ts, use_open_price=True) 
-        
-        # 3. 更新持仓市值与账户净值 (基于当前 T 的收盘价 Close)
-        # 这里刷新了 self.equity, self.equity_peak, self.cash_ratio 等
-        self.update_positions(ts)
-        self.init_state(ts, close) # 刷新 Greeks 和价格观察
-        self._update_comb_equity() 
-        
-        # 4. 计算本步总收益 (供夏普和日志使用)
-        # 注意：这里的收益包含了 (T-1到T的价格波动) + (a_{t-1}产生的摩擦成本)
-        self.target_gain = (self.equity - prev_equity) / (prev_equity + 1e-8)
-        self.raw_returns.append(self.target_gain)
-        self.equity_list.append(self.equity) 
-        self.time_list.append(ts)
-
-        # 5. 调用你提供的原版 getReward
-        # 此时 equity_list 已更新，prev 是上一步，cur 是当前步，逻辑完美对齐
-        reward = self.getReward(self.last_action)
-        self.last_action = action
-
-        # 6. 获取状态 (作为下一回合决策的输入)
-        curr, hist = self.get_total_state()
-
-        # 7. 提交本回合动作 a_T (Pending，下个 Step 才会成交)
-        call, put = self.comb['call'], self.comb['put']
-        
-        # 结合 Weight 动态计算下单量 (购买力约束 90%)
-        max_margin_allow = self.free_money * 0.9
-        margin_per_pair = self.getMargin(call) + self.getMargin(put)
-        cap_vol = int(max_margin_allow / (margin_per_pair + 1e-6))
-        target_vol = int(min(cap_vol, 50) * weight) 
-        if weight > 0 and target_vol < 1: target_vol = 1
-
-        if action == 1: self.open_long_pair(target_vol, ts, call, put)
-        elif action == 2: self.open_short_pair(target_vol, ts, call, put)
-        elif action == 3: self.close_pair(ts, call, put, w=weight)
-
-        return curr, hist, reward, self.if_truncated()
-
-
-    # 增加计算夏普的方法：
-    def get_sharpe_ratio(self):
-        """
-        计算当前 Episode 的年化夏普比率
-        年化因子 = sqrt(252天 * 每天8根30分钟K线) = sqrt(2016)
-        """
-        if len(self.raw_returns) < 2:
-            return 0.0
-        
-        returns_arr = np.array(self.raw_returns)
-        mean_ret = np.mean(returns_arr)
-        std_ret = np.std(returns_arr) + 1e-9 # 防止除零
-        
-        # 30分钟K线的年化因子
-        annual_factor = np.sqrt(252 * 8) 
-        sharpe = annual_factor * (mean_ret / std_ret)
-        return float(sharpe)
-
+    def has_positions(self):
+        if self.comb['pos_size'] != 0:
+            return True
+        return False  
 
     def init_state(self, time_str: str, close: float):
         """仅查表，不计算，极速更新当前时刻的市场状态"""
@@ -1053,9 +984,6 @@ class single_Account:
         expire = self.option_info_controller.get_expireDate(call)
         self.comb['call_ttm'] = self.real_info_controller.get_ttm(time_str, expire)
         self.comb['put_ttm']  = self.comb['call_ttm']
-
-        # self._update_position_values(time_str)
-        # self._update_comb_equity()
 
     def get_history_state(self):
         # 修复 NoneType 错误
@@ -1127,14 +1055,69 @@ class single_Account:
         
         self.h_states.append(single)
         return current_state, self.get_history_state()
-    
-    def getReward(self, action: int, eps: float=1e-6):
+
+    # ================= 强化学习接口 =================
+    def step(self, action, weight, ts, close, ts_next, close_next):
         """
-        12月20日 优化版：解决 EV 高但不敢做多、市值巨震的问题
+        Args:
+            action/weight(a_T, w_T): T收盘时的决策
+            ts/close: T的时间戳和收盘价
+            ts_next/close_next: T+1的时间戳和收盘价
+
+        Logic:
+            * T时刻提交动作, 在T+1开盘价成交
+            * T+1收盘时查看持仓市值和账户信息
         """
-        if len(self.equity_list) <= 1: return 0.0
+
+        # 立即提交订单: 结合 Weight 动态计算下单量 (购买力约束 90%)
+        call, put = self.comb['call'], self.comb['put']
+        max_margin_allow = self.free_money * 0.9
+        margin_per_pair = self.getMargin(call) + self.getMargin(put)
+        cap_vol = int(max_margin_allow / (margin_per_pair + self.eps))
+        target_vol = int(min(cap_vol, 50) * weight) 
+
+        if weight > 0 and target_vol < 1: 
+            target_vol = 1
+
+        if action == 1:
+            self.open_long_pair(target_vol, ts, call, put)
+        elif action == 2: 
+            self.open_short_pair(target_vol, ts, call, put)
+        elif action == 3: 
+            self.close_pair(ts, call, put, w=weight)
+
+        # 立即成交, 按照T+1的开盘价, 这会更新资金
+        self.simulate_fill(ts_next, use_open_price=True)
+
+        # 推进时间观察, 根据T+1更新持仓的市值
+        self.update_positions(ts_next, use_open=True)
+
+        # T+1开盘价市值
+        equity_open = self.equity
+
+        self.update_positions(ts_next, use_open=False)
         
-        prev, cur = self.equity_list[-2], self.equity_list[-1]
+        # 刷新T+1时的状态(greeks)
+        self.init_state(ts_next, close_next)
+        self._update_comb_equity()
+        self.equity_list.append(self.equity)
+
+        # 计算reward
+        reward = self.getReward(equity_open, action)
+        self.last_action = action
+
+        # 获取状态(T+1收盘时的状态)
+        curr, hist = self.get_total_state()
+
+        return curr, hist, reward, self.if_truncated()
+
+
+    def getReward(self, equity_open: float, action: int, eps: float=1e-6):
+        if len(self.equity_list) <= 1: 
+            return 0.0
+        
+        # perv: T+1开盘净值 | cur: T+1收盘净值
+        prev, cur = equity_open, self.equity_list[-1]
         peak = self.equity_peak
         
         # 使用对数收益率
@@ -1177,143 +1160,20 @@ class single_Account:
             
         return float(final_reward)
 
-
-    def getReward_1220(self, action: int, eps: float=1e-6):
-        if len(self.equity_list) <= 1: return 0.0
+    # 增加计算夏普的方法：
+    def get_sharpe_ratio(self):
+        """
+        计算当前 Episode 的年化夏普比率
+        年化因子 = sqrt(252天 * 每天8根30分钟K线) = sqrt(2016)
+        """
+        if len(self.raw_returns) < 2:
+            return 0.0
         
-        prev, cur = self.equity_list[-2], self.equity_list[-1]
-        step_ret = np.log((cur + eps) / (prev + eps))
+        returns_arr = np.array(self.raw_returns)
+        mean_ret = np.mean(returns_arr)
+        std_ret = np.std(returns_arr) + 1e-9 # 防止除零
         
-        # 1. 基础收益：稍微调低一点点，防止对单步波动过敏
-        final_reward = step_ret * 60.0 
-
-        # 2. 利润保护 (🔥新增)：如果当前已经盈利，回撤的惩罚要加倍
-        # 这样能强制模型在赚到钱后学会“落袋为安”，而不是回吐利润
-        if cur > self.init_capital and step_ret < 0:
-            final_reward += step_ret * 40.0 # 额外的亏损权重
-
-        # 3. 差分回撤惩罚 (保持)
-        peak = self.equity_peak
-        cur_dd = (peak - cur) / (peak + eps)
-        prev_dd = (peak - prev) / (peak + eps)
-        if cur_dd > prev_dd:
-            final_reward -= (cur_dd - prev_dd) * 50.0
-
-        # 4. 交易频率惩罚 (稍微加大，防止频繁平仓刷步数)
-        if action in [1, 2]: 
-            final_reward -= 0.01  # 从 0.005 升到 0.01
-
-        # 5. Reward Clipping (保持 1.5，这是 4090D 训练稳定的关键)
-        final_reward = np.clip(final_reward, -1.5, 1.5)
-            
-        return float(final_reward)
-
-
-
-    
-
-    def if_truncated(self) -> bool:
-        return (self.equity / self.init_capital) < 0.05
-    
-    def getInfo(self):
-        return self.info
-
-    def has_positions(self):
-        if self.comb['pos_size'] != 0:
-            return True
-        return False
-
-    def combine_label_step(self, ts: str, close: float, targetCode: str='510050'):
-        return {}
-    
-# ========================== 用例 ==========================
-if __name__ == '__main__':
-    # 示例：单组合跨式 + 逐步调用step
-    start_time = '20250825100000'
-    # start_time = '20251025100000'
-    # start_time = '20250923143000'
-    end_time = '20250925150000'
-    # end_time = '20251125150000'
-
-    calls, puts = [], []
-
-    call = '10008800'
-    put = '10008809'
-   
-    account = single_Account(100000, fee=1.3, period='30m', stockList=['510050'])
-
-    account.set_combos(call, put)
-    target = '510050'
-
-
-    # dtype = {
-    #     'call': str,
-    #     'put': str,
-    #     'call_strike': int,
-    #     'put_strike': int,
-    #     'call_open': str,
-    #     'put_open': str,
-    #     'call_expire': str,
-    #     'put_expire': str,
-    #     'ignore_days': int,
-    #     'steps': int,
-    # }
-    
-
-    # def calculate_score(row):
-    #     """自定义计算逻辑，输入是一行数据"""
-    #     start = row['call_open']
-    #     end = row['call_expire']
-
-
-    #     start_time = datetime.strptime(start, "%Y%m%d")
-    #     end_time = datetime.strptime(end, "%Y%m%d")
-    #     days = (end_time - start_time).days
-
-    #     call = row['call']
-    
-    #     if days <= 40:
-    #         return 0
-
-    #     end_time = end_time - timedelta(days=20)
-    #     end_time = end_time.strftime('%Y%m%d')
-
-    #     start_time = start + '100000'
-    #     end_time = end_time + '150000'
-        
-    #     return account.get_step_length(call, start_time, end_time)
-
-    # df = pd.read_excel('./miniQMT/datasets/all_label_data/20251213_train.xlsx', dtype=dtype)
-    # df['steps'] = df.apply(calculate_score, axis=1)
-    # df['ignore_days'] = df.apply(lambda row: 20, axis=1)
-    # df['Call_strike'] = df.apply(lambda row: account.option_info_controller.get_strikePrice(row['call']), axis=1)
-    # df['Put_strike'] = df.apply(lambda row: account.option_info_controller.get_strikePrice(row['put']), axis=1)
-
-    # df.to_excel('./miniQMT/datasets/all_label_data/20251213_train.xlsx', index=False)
-    # print(0 / 0)
-
-    # 取样本数据(你的 RealInfo 里方法名可能是 get_bars_between 或 get_bars_between_from_df)
-    try:
-        data = account.real_info_controller.get_bars_between(target, start_time, end_time, '30m')
-    except AttributeError:
-        data = account.real_info_controller.get_bars_between_from_df(target, start_time, end_time, '30m')
-
-    account.preload_data(start_time, end_time)
-    # 初始化一次
-    first_close = float(data.iloc[0].close)
-    first_ts = str(data.iloc[0].ts).replace(' ', '').replace('-', '').replace(':', '')
-    account.init_state(first_ts, first_close)
-
-    for i in range(len(data)):
-        ts = str(data.iloc[i].ts).replace(' ', '').replace('-', '').replace(':', '')
-        close = float(data.iloc[i].close)
-
-        if i == 0:
-            account.step(2, 1, ts, close)
-        elif ts[0: 8] != '20250925':
-            react_state, state, reward, truncated = account.step(0, 0, ts, close)
-
-        
-    # print(0 / 0)
-
-    # account.out_excel()
+        # 30分钟K线的年化因子
+        annual_factor = np.sqrt(252 * 8) 
+        sharpe = annual_factor * (mean_ret / std_ret)
+        return float(sharpe)

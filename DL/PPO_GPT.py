@@ -29,6 +29,7 @@ import multiprocessing as mp
 from finTool.single_window_account_fast import single_Account
 import os
 import traceback
+from datetime import datetime, timedelta
 
 import warnings
 # 忽略所有 FutureWarning
@@ -85,79 +86,79 @@ class outPut():
 # =========================
 # Normalization (n==0 -> return x)
 # =========================
-class RunningMeanStd:
-    def __init__(self, shape, dtype=torch.float32, eps=1e-8, device="cpu"):
-        self.eps = float(eps)
-        self.n = 0  # keep int
-        self.mean = torch.zeros(shape, dtype=dtype, device=device)
-        self.var = torch.ones(shape, dtype=dtype, device=device)
-        self.std = torch.sqrt(self.var).clamp_min(self.eps)
+# class RunningMeanStd:
+#     def __init__(self, shape, dtype=torch.float32, eps=1e-8, device="cpu"):
+#         self.eps = float(eps)
+#         self.n = 0  # keep int
+#         self.mean = torch.zeros(shape, dtype=dtype, device=device)
+#         self.var = torch.ones(shape, dtype=dtype, device=device)
+#         self.std = torch.sqrt(self.var).clamp_min(self.eps)
 
-    def update(self, x: torch.Tensor):
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-        B = int(x.shape[0])
-        if B <= 0:
-            return
+#     def update(self, x: torch.Tensor):
+#         if x.dim() == 1:
+#             x = x.unsqueeze(0)
+#         B = int(x.shape[0])
+#         if B <= 0:
+#             return
 
-        n_old = int(self.n)
-        n_new = n_old + B
+#         n_old = int(self.n)
+#         n_new = n_old + B
 
-        if n_old == 0:
-            mean = x.mean(dim=0)
-            var = x.var(dim=0, unbiased=False)
-            self.mean = mean
-            self.var = var
-            self.std = torch.sqrt(self.var.clamp_min(self.eps))
-            self.n = n_new
-            return
+#         if n_old == 0:
+#             mean = x.mean(dim=0)
+#             var = x.var(dim=0, unbiased=False)
+#             self.mean = mean
+#             self.var = var
+#             self.std = torch.sqrt(self.var.clamp_min(self.eps))
+#             self.n = n_new
+#             return
 
-        old_mean = self.mean
-        old_var = self.var
-        batch_mean = x.mean(dim=0)
-        batch_var = x.var(dim=0, unbiased=False)
+#         old_mean = self.mean
+#         old_var = self.var
+#         batch_mean = x.mean(dim=0)
+#         batch_var = x.var(dim=0, unbiased=False)
 
-        delta = batch_mean - old_mean
-        mean = old_mean + delta * (B / n_new)
+#         delta = batch_mean - old_mean
+#         mean = old_mean + delta * (B / n_new)
 
-        m2_old = old_var * n_old
-        m2_batch = batch_var * B
-        m2 = m2_old + m2_batch + (delta ** 2) * (n_old * B / n_new)
-        var = m2 / n_new
+#         m2_old = old_var * n_old
+#         m2_batch = batch_var * B
+#         m2 = m2_old + m2_batch + (delta ** 2) * (n_old * B / n_new)
+#         var = m2 / n_new
 
-        self.mean = mean
-        self.var = var
-        self.std = torch.sqrt(self.var.clamp_min(self.eps))
-        self.n = n_new
+#         self.mean = mean
+#         self.var = var
+#         self.std = torch.sqrt(self.var.clamp_min(self.eps))
+#         self.n = n_new
 
 
-class Normalization:
-    def __init__(self, shape, dtype=torch.float32, eps=1e-8, device="cpu"):
-        self.running_ms = RunningMeanStd(shape=shape, dtype=dtype, eps=eps, device=device)
-        self.eps = float(eps)
+# class Normalization:
+#     def __init__(self, shape, dtype=torch.float32, eps=1e-8, device="cpu"):
+#         self.running_ms = RunningMeanStd(shape=shape, dtype=dtype, eps=eps, device=device)
+#         self.eps = float(eps)
 
-    def __call__(self, x: torch.Tensor, update=True):
-        if update:
-            self.running_ms.update(x.detach())
-        if int(self.running_ms.n) == 0:
-            return x
-        return (x - self.running_ms.mean) / (self.running_ms.std + self.eps)
+#     def __call__(self, x: torch.Tensor, update=True):
+#         if update:
+#             self.running_ms.update(x.detach())
+#         if int(self.running_ms.n) == 0:
+#             return x
+#         return (x - self.running_ms.mean) / (self.running_ms.std + self.eps)
 
-    def state_dict(self):
-        return {
-            "n": int(self.running_ms.n),
-            "mean": self.running_ms.mean.detach().cpu(),
-            "var": self.running_ms.var.detach().cpu(),
-            "std": self.running_ms.std.detach().cpu(),
-            "eps": self.eps,
-        }
+#     def state_dict(self):
+#         return {
+#             "n": int(self.running_ms.n),
+#             "mean": self.running_ms.mean.detach().cpu(),
+#             "var": self.running_ms.var.detach().cpu(),
+#             "std": self.running_ms.std.detach().cpu(),
+#             "eps": self.eps,
+#         }
 
-    def load_state_dict(self, d: Dict[str, Any], device="cpu"):
-        self.eps = float(d.get("eps", self.eps))
-        self.running_ms.n = int(d["n"])
-        self.running_ms.mean = d["mean"].to(device)
-        self.running_ms.var = d["var"].to(device)
-        self.running_ms.std = d.get("std", torch.sqrt(self.running_ms.var)).to(device)
+#     def load_state_dict(self, d: Dict[str, Any], device="cpu"):
+#         self.eps = float(d.get("eps", self.eps))
+#         self.running_ms.n = int(d["n"])
+#         self.running_ms.mean = d["mean"].to(device)
+#         self.running_ms.var = d["var"].to(device)
+#         self.running_ms.std = d.get("std", torch.sqrt(self.running_ms.var)).to(device)
 
 
 # =========================
@@ -285,6 +286,7 @@ class FeaturePipeline:
             hist = hist.unsqueeze(0)
 
         call_state, put_state = torch.chunk(hist, chunks=2, dim=2)
+        physical_call, physical_put = call_state[:, -1, :], put_state[:, -1, :]
         call_tok, put_tok = self._encode_tokens_only(call_state, put_state)
 
         dims = {
@@ -301,7 +303,8 @@ class FeaturePipeline:
 
         reduce_call = self.adapter(call_tok)
         reduce_put = self.adapter(put_tok)
-        raw = torch.cat([curr.float(), reduce_call.float(), reduce_put.float()], dim=-1)
+        # raw = torch.cat([curr.float(), reduce_call.float(), reduce_put.float()], dim=-1)
+        raw = torch.cat([curr.float(),  physical_call.float(), physical_put.float(), reduce_call.float(), reduce_put.float()], dim=-1)
         return raw, dims
 
     @torch.no_grad()
@@ -478,7 +481,50 @@ def worker(remote, parent_remote, env_fn_wrapper, worker_cfg: Dict[str, Any]):
         if critic is not None and payload.get("critic_state") is not None:
             critic.load_state_dict(payload["critic_state"], strict=True)
 
-    def sample_action_weight(state_1d: torch.Tensor) -> Tuple[int, int, float, float, float]:
+    def sample_action_weight(state_1d: torch.Tensor, deterministic=False) -> Tuple[int, int, float, float, float]:
+        with torch.no_grad():
+            assert actor is not None and critic is not None
+            logits_a, logits_w = actor(state_1d)
+            logits_a = logits_a.squeeze(0)
+            logits_w = logits_w.squeeze(0)
+
+            dist_a = Categorical(logits=logits_a)
+            
+            # --- 动作 A 选择 ---
+            if deterministic:
+                a = int(torch.argmax(logits_a, dim=-1).item())
+            else:
+                a = int(dist_a.sample().item())
+            
+            logp_a = float(dist_a.log_prob(torch.tensor(a)).item())
+
+            # 掩码逻辑
+            allowed = torch.zeros(5, dtype=torch.bool)
+            if a in (A_LONG, A_SHORT, A_CLOSE):
+                allowed[1:] = True
+                need_w = 1.0
+            else:
+                allowed[0] = True
+                need_w = 0.0
+
+            masked = logits_w.clone()
+            masked[~allowed] = -1e9
+            dist_w = Categorical(logits=masked)
+
+            # --- 权重 WI 选择 ---
+            if deterministic:
+                wi = int(torch.argmax(masked, dim=-1).item())
+            else:
+                wi = int(dist_w.sample().item())
+                
+            logp_w = float(dist_w.log_prob(torch.tensor(wi)).item())
+
+            wv = float(WEIGHT_BINS[wi])
+            logp_joint = logp_a + need_w * logp_w
+            v = float(critic(state_1d).squeeze(-1).item())
+            return a, wi, wv, logp_joint, v
+
+    def sample_action_weight_old(state_1d: torch.Tensor, deterministic=False) -> Tuple[int, int, float, float, float]:
         """
         注意：这个函数本身不包 no_grad，但它只会在 rollout 循环的 with torch.no_grad() 内被调用
         所以不会产生梯度图，也不会占 GPU/CPU 的反传开销。
@@ -490,6 +536,7 @@ def worker(remote, parent_remote, env_fn_wrapper, worker_cfg: Dict[str, Any]):
             logits_w = logits_w.squeeze(0)
 
             dist_a = Categorical(logits=logits_a)
+
             a = int(dist_a.sample().item())
             logp_a = float(dist_a.log_prob(torch.tensor(a)).item())
 
@@ -573,8 +620,6 @@ def worker(remote, parent_remote, env_fn_wrapper, worker_cfg: Dict[str, Any]):
                 logp_old = np.zeros((T,), np.float32)
                 value_old = np.zeros((T,), np.float32)
 
-                # rewards 对齐：rewards[t] 应该是 “t 动作”的奖励
-                # 但 env.step 在 t 返回的是 (t-1) 动作的奖励，所以我们写 rewards[t-1] = r_scaled
                 rewards = np.zeros((T,), np.float32)
 
                 done = np.zeros((T,), np.bool_)    # done[t] 对应 “t 动作之后是否终止”
@@ -637,17 +682,22 @@ def worker(remote, parent_remote, env_fn_wrapper, worker_cfg: Dict[str, Any]):
                     # 并且 t=0 的 r 丢弃
                     try:
                         r_in = torch.as_tensor([float(r)], dtype=torch.float32)
-                        r_scaled = float(r_scaler(r_in).item())
+                        # r_scaled = float(r_scaler(r_in).item())
                     except Exception:
                         # 兜底：如果 RewardScaling 支持 float 输入
-                        r_scaled = float(r_scaler(float(r)))
-
-                    if t > 0:
-                        # 只有 (t-1) 这个 transition 才真正拿到了属于它的 reward，所以才 valid
-                        rewards[t - 1] = r_scaled
-                        # 注意：t-1 这步是否有效，还得看 t-1 自己是否是“最后一步”/是否被提前终止
-                        # 这里只保证 reward 已对齐到 t-1
-                        valid[t - 1] = True
+                        # r_scaled = float(r_scaler(float(r)))
+                        pass
+                    
+                    # rewards[t] = r_scaled
+                    rewards[t] = r_in
+                    valid[t] = True
+                    # if t > 0:
+                    #     # 只有 (t-1) 这个 transition 才真正拿到了属于它的 reward，所以才 valid
+                    #     rewards[t - 1] = r_scaled
+                    #     # 注意：t-1 这步是否有效，还得看 t-1 自己是否是“最后一步”/是否被提前终止
+                    #     # 这里只保证 reward 已对齐到 t-1
+                    #     valid[t - 1] = True
+                    
 
                     # 当前 t 这步：reward 还没来，所以先不置 valid[t]
                     # 如果这一刻终止了，那么这一步永远等不到 reward -> valid[t] 必须 False
@@ -977,6 +1027,9 @@ class LearnerPPO:
             hist = hist.unsqueeze(0)
 
         call_state, put_state = torch.chunk(hist, chunks=2, dim=2)
+
+        physical_call, physical_put = call_state[:, -1, :], put_state[:, -1, :]
+
         call_tok, put_tok = self._encode_tokens_only(call_state, put_state)
 
         if self.adapter_dims is None:
@@ -995,8 +1048,10 @@ class LearnerPPO:
 
         reduce_call = self.adapter(call_tok)
         reduce_put = self.adapter(put_tok)
-        raw = torch.cat([curr.float(), reduce_call.float(), reduce_put.float()], dim=-1)
+        
+        raw = torch.cat([curr.float(),  physical_call.float(), physical_put.float(), reduce_call.float(), reduce_put.float()], dim=-1)
         state_dim = int(raw.shape[-1])
+
 
         if self.norm is None:
             self.norm = Normalization(shape=(state_dim,), device=self.device)
@@ -1029,12 +1084,28 @@ class LearnerPPO:
         self._maybe_build(curr, hist)
         assert self.adapter is not None and self.norm is not None
 
+        # 1. 拆分状态
         call_state, put_state = torch.chunk(hist, chunks=2, dim=2)
+        
+        # 2. 提取物理特征 (与 _maybe_build 对齐)
+        physical_call, physical_put = call_state[:, -1, :], put_state[:, -1, :]
+        
+        # 3. 提取特征 Token
         call_tok, put_tok = self._encode_tokens_only(call_state, put_state)
 
+        # 4. Adapter 投影
         reduce_call = self.adapter(call_tok)
         reduce_put = self.adapter(put_tok)
-        raw = torch.cat([curr.float(), reduce_call.float(), reduce_put.float()], dim=-1)
+        
+        # 5. 🔥 核心修复：这里必须拼 5 个部分，总维度才是 547
+        raw = torch.cat([
+            curr.float(), 
+            physical_call.float(), 
+            physical_put.float(), 
+            reduce_call.float(), 
+            reduce_put.float()
+        ], dim=-1)
+        
         s = self.norm(raw, update=norm_update)
         return raw, s
     
@@ -1181,7 +1252,6 @@ class LearnerPPO:
                     entropy = ent_a + 0.5 * ent_w
                     
                     # --- 🔥 总 Loss 计算 (VF权重提升至0.5) ---
-                    # 增强价值网络学习力度，使其能真正感知到 -150 的代价
                     loss = actor_loss + 0.5 * value_loss - 0.05 * entropy
                     
                     self.opt_adapter.zero_grad(set_to_none=True)
@@ -1895,7 +1965,7 @@ class AgentConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_eps: float = 0.2
-    k_epochs: int = 15
+    k_epochs: int = 8
     epochs: int = 50,
     actor_lr: float = 3e-4
     critic_lr: float = 5e-4
@@ -1978,6 +2048,7 @@ class Agent:
         tmp.close()
         c0_t = torch.from_numpy(np.asarray(c0, np.float32)).to(self.device)
         h0_t = torch.from_numpy(np.asarray(h0, np.float32)).to(self.device)
+
         self.learner._maybe_build(c0_t.unsqueeze(0), h0_t.unsqueeze(0))
 
         self.records = {
@@ -1990,6 +2061,7 @@ class Agent:
             'golden_task_count': [],   # ✅ 新增：进入黄金区间的任务数量
             'gambling_task_count': [], # ✅ 新增：在赌博区间的任务数量
         }
+
 
         # Warmup Normalization (修复版)
         print("[Info] Warming up Normalization layers...")
@@ -2014,6 +2086,7 @@ class Agent:
 
 
     def train_dynamic(self, from_check_point: bool = False):
+        print(f'shape = {self.learner.norm.running_ms.mean.shape}')
         if from_check_point:
             sys.stdout = outPut("./miniQMT/DL/results/PPO_records.txt", mode='a')
         else:
@@ -2063,8 +2136,8 @@ class Agent:
 
         # 早停相关
         best_reward = -float('inf')
-        patience = getattr(self.cfg, 'patience', 300)
-        stop_entropy = getattr(self.cfg, 'stop_entropy', 0.6)
+        patience = getattr(self.cfg, 'patience', 15)
+        stop_entropy = getattr(self.cfg, 'stop_entropy', 0.8)
         min_delta = 0.001
         early_stop_counter = 0
 
@@ -2177,16 +2250,6 @@ class Agent:
                 continue
 
             t0 = time.time()
-        
-            # # 阶梯式 Fee Warm-up
-            # if ep < 5:
-            #     current_fee = 0.0
-            # elif ep < 10:
-            #     current_fee = 0.8  # 先给点小压力
-            # elif ep < 15:
-            #     current_fee = 1.0
-            # else:
-            #     current_fee = self.cfg.fee # 最终 1.3
             
             if ep == 0 or ep == 1: # 每50轮打印并同步一次即可
                 #  print(f"[Curriculum-warmup] Set Fee to {current_fee}")
@@ -2252,6 +2315,7 @@ class Agent:
 
                 # 2) broadcast weights + norm snapshot
                 payload = self.learner.export_payload()
+
                 self.vec_env.set_weights_all(payload)
 
                 # 3) one-shot rollout（一次 IPC 收全轨迹）
@@ -2389,6 +2453,9 @@ class Agent:
                         ])
             print("[Info] Scaled reward mean/std/min/max:", rs.mean(), rs.std(), rs.min(), rs.max())
 
+            if ep >= 50:
+                self.k_epochs = 5
+
             loss, kl, a_loss, v_loss, ent, ev = self.learner.update_from_trajs(trajs_for_update)
             # loss, kl, a_loss, v_loss, ent = self.learner.update_from_trajs(trajs_for_update)
 
@@ -2510,6 +2577,54 @@ class Agent:
         sys.stdout.flush() # 强制将缓冲区写入磁盘
 
 
+def run_oos_test(model_path, test_pairs, cfg):
+    """
+    样本外测试 (Out-of-Sample Test)
+    """
+    # 1. 初始化测试环境（注意 is_test=True）
+    test_cfg = cfg.__dict__.copy()
+    test_cfg['is_test'] = True
+    
+    # 2. 加载 Learner 并加载权重
+    learner = LearnerPPO(...) # 按参数初始化
+    learner.load_checkpoint(model_path)
+    learner.actor.eval() # 开启评估模式
+    
+    all_equities = []
+    
+    for pair in test_pairs:
+        env = DynamicWindowEnv([pair], test_cfg)
+        curr, hist, _ = env.reset()
+        done = False
+        equities = [cfg.init_capital]
+        
+        while not done:
+            # 转 Tensor
+            c_t = torch.from_numpy(curr).float().unsqueeze(0).to(learner.device)
+            h_t = torch.from_numpy(hist).float().unsqueeze(0).to(learner.device)
+            
+            # 确定性推理
+            with torch.no_grad():
+                _, s = learner._build_state(c_t, h_t, norm_update=False)
+                # 调用 deterministic=True 的预测
+                a, wi, wv, _, _ = learner.sample_action_weight(s, deterministic=True)
+            
+            # 环境步进
+            curr, hist, r, term, trunc = env.step(a, wv)
+            equities.append(env.account_controller.equity)
+            done = term or trunc
+            
+        all_equities.append(equities)
+        print(f"Task {pair['call']} Finished. Final Equity: {equities[-1]:.2f}")
+    
+    # 绘制净值图
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(12, 6))
+    for eq in all_equities:
+        plt.plot(eq)
+    plt.title("Out-of-Sample Performance")
+    plt.show()
+
 # =========================
 # Entry
 # =========================
@@ -2532,6 +2647,37 @@ if __name__ == "__main__":
         '10008051', '10007345', '10007721', '10007464', '10007344', '10007988', '10006433', 
         '10006820', '10007720', '10007987', '10006746', '10006745', '10007463', '10006432', '10007719'
     ]
+    
+    all_pairs = []
+
+    for index, row in df.iterrows():
+        start = row['call_open']
+        end = row['call_expire']
+
+        start_time = datetime.strptime(start, "%Y%m%d")
+        end_time = datetime.strptime(end, "%Y%m%d")
+        days = (end_time - start_time).days
+
+        if days <= 40:
+            continue
+
+        call = row['call']
+        put = row['put']
+
+        if call in exclude_list or put in exclude_list:
+            continue
+        end_time = start_time + timedelta(days=20)
+        end_time = end_time.strftime('%Y%m%d')
+
+        start_time = start + '100000'
+        end_time = end_time + '150000'
+        all_pairs.append({
+            'call': call,
+            'put': put,
+            'start_time': start_time,
+            'end_time': end_time
+        })
+
 
     # 2. 动态分类采样逻辑
     all_pairs = []
@@ -2606,23 +2752,24 @@ if __name__ == "__main__":
         option_pairs=all_pairs,
         window_size=32,
         pre_len=4,
-        epochs=1500,
-        rollout_T=2048 * 8,     # 每次更新采样的基础长度
-        num_workers=14,      # 维持 12 线程
+        epochs=300,
+        rollout_T=2048 * 12,     # 每次更新采样的基础长度
+        num_workers=16,      # 维持 12 线程
         save_excel=True,
         # --- 核心参数调整 ---
         hidden_dim=256,      # 提升网络宽度以适应复杂逻辑
-        adapter_dim=256,     # 提升特征投影维度
-        mini_batch=2048 * 16, # 保持大 Batch 稳定梯度
-        actor_lr=1e-4,
-        critic_lr=3e-4,
-        check_path='./miniQMT/DL/checkout/check_data_parallel.pt'
+        adapter_dim=128,     # 提升特征投影维度
+        mini_batch=2048 * 12, # 保持大 Batch 稳定梯度
+        actor_lr=2e-4,
+        critic_lr=5e-4,
+        check_path='./miniQMT/DL/checkout/check_data_parallel.pt',
+        k_epochs=10
     )
 
     agent = Agent(cfg)
 
     try:
         # 如果你修改了 hidden_dim，建议从 False 开始，因为旧权重形状不匹配
-        agent.train_dynamic(from_check_point=True) 
+        agent.train_dynamic(from_check_point=False) 
     finally:
         agent.close()

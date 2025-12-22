@@ -10,7 +10,8 @@
     4. [新增] 配合 single_Account 极速版，调用 preload_data 预热缓存。
 """
 from abc import ABC, abstractmethod
-from finTool.single_window_account_fast import single_Account
+# from finTool.single_window_account_fast import single_Account
+from Engine import tradeEngine as single_Account
 import numpy as np
 import torch
 
@@ -82,6 +83,7 @@ class windowEnv(baseEnv):
         current_state = torch.tensor(current_state, dtype=torch.float32)
         history_state = torch.tensor(history_state, dtype=torch.float32)
         return current_state.shape, history_state.shape
+    
     def get_smooth_reward(self, raw_terminal_bonus):
         """
         将 -150 到 1.5 的极端奖励映射到神经网络易于消化的 [-5.0, 1.5]
@@ -97,21 +99,23 @@ class windowEnv(baseEnv):
 
     def step(self, action, weight, test: bool=False) -> tuple:
         # 1. 越界保护
-        if self.row_index >= self.total_length:
+        if self.row_index >= self.total_length - 1:
             curr, hist = self.account_controller.get_total_state()
             return curr, hist, 0.0, True, True
         
         ts = self.ts_arr[self.row_index]
         close = self.close_arr[self.row_index]
         self.row_index += 1
+        ts_next = self.ts_arr[self.row_index]
+        close_next = self.close_arr[self.row_index]
 
         # 2. 判断是否是最后一步
-        is_terminal = (self.row_index >= min(self.total_length, self.timesteps))
+        is_terminal = (self.row_index >= min(self.total_length, self.timesteps) - 1)
 
         if is_terminal:
             # --- 最后一步强制平仓结算 ---
             final_action = 3 if self.account_controller.has_positions() else action
-            curr, hist, step_reward, truncated = self.account_controller.step(final_action, weight, ts, close)
+            curr, hist, step_reward, truncated = self.account_controller.step(final_action, weight, ts, close, ts_next, close_next)
             
             peak = self.account_controller.equity_peak
             current = self.account_controller.equity
@@ -153,7 +157,7 @@ class windowEnv(baseEnv):
             return curr, hist, final_reward, True, truncated
 
         # 3. 正常中间步骤
-        current_state, history_state, reward, truncated = self.account_controller.step(action, weight, ts, close)
+        current_state, history_state, reward, truncated = self.account_controller.step(action, weight, ts, close, ts_next, close_next)
         self.reward_list.append(reward)
         return current_state, history_state, reward, False, truncated
 
@@ -203,7 +207,8 @@ class windowEnv(baseEnv):
 
         current_state, _ = self.account_controller.get_total_state()
         history_state = self.account_controller.get_history_state()
-        info = self.account_controller.getInfo()
+        # info = self.account_controller.getInfo()
+        info = {'message': 'default'}
 
         return current_state, history_state, info
     

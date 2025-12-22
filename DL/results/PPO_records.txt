@@ -1,0 +1,8 @@
+[Agent-init-train] 期权组合数量 = 6 | 进程数量 = 2
+ ------ Start to train PPO on cpu, Time_stamp: 2025-12-21 18:05:32 --- 
+PPO Hyperparams 1: gamma = 0.99, gae_lambda = 0.95, clip_eps = 0.2
+PPO Hyperparams 2: k_epochs = 15, update_mb_size = 32768, total_epochs = 1
+PPO Hyperparams 3: actor_lr = 0.0001, critic_lr = 0.0003
+Model Dims: adapter_dim = 256, hidden_dim = 256
+------------------------------------------------------------------------------
+[Info] 采样目标, rollout_T_big = 1024

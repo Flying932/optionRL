@@ -8,11 +8,11 @@ import pandas as pd
 import os
 
 
-if __name__ == '__main__' or __name__ == '__mp_main__':
+try:
     from preTrainITransformer import iTransformerConfig, iTransformer
     from preTrainBasisFormer import BasisFormerConfig, BasisFormer
     from preTrainVARMA import VARMAConfig, VARMAformer
-else:
+except Exception as e:
     from preTrain.preTrainITransformer import iTransformerConfig, iTransformer
     from preTrain.preTrainBasisFormer import BasisFormerConfig, BasisFormer
     from preTrain.preTrainVARMA import VARMAConfig, VARMAformer
